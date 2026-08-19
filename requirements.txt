@@ -2,3 +2,4 @@ python-telegram-bot
 google-genai
 pillow
 python-dotenv
+psycopg2-binary
