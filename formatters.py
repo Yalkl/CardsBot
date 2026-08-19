@@ -119,8 +119,8 @@ def render_preview(
     missing_notice = ""
     if not phone or (not data.get("first_name") and not data.get("company")):
         missing_notice = (
-            "💡 **חסרים פרטים?** אם יש מידע בצד השני של הכרטיס, "
-            "לחץ על **'📷 סרוק צד שני'** כדי להשלים ולמזג את הנתונים.\n\n---\n"
+            "💡 **Missing info?** If there are details on the other side of the card, "
+            "tap **'📷 Scan Back Side'** to merge the info.\n\n---\n"
         )
 
     person_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
@@ -153,17 +153,17 @@ def render_preview(
         [InlineKeyboardButton(btn_label, callback_data="save_default")],
         [
             InlineKeyboardButton(
-                "📷 סרוק צד שני (מיזוג)", callback_data="scan_second_side"
+                "📷 Scan Back Side (Merge)", callback_data="scan_second_side"
             ),
             InlineKeyboardButton(
-                "🏷️ שייך לכנס/אירוע", callback_data="ask_event"
+                "🏷️ Assign Event", callback_data="ask_event"
             ),
         ],
         [
             InlineKeyboardButton(
-                "✏️ ערוך פרטים", callback_data="open_edit_menu"
+                "✏️ Edit Details", callback_data="open_edit_menu"
             )
         ],
-        [InlineKeyboardButton("❌ ביטול", callback_data="cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
