@@ -11,7 +11,6 @@ def build_formatted_name(data: dict, event_name: str = None) -> str:
     country = (data.get("country") or "").strip()
     job_title = (data.get("job_title") or "").strip()
 
-    # If no person name, the company/business is the primary name
     primary = full_name if full_name else company
     name_elements = [primary] if primary else []
 
@@ -117,10 +116,18 @@ def render_preview(
             f"as `{duplicate_info['name']}` ({duplicate_info['match_type']} matched).\n\n---\n"
         )
 
+    missing_notice = ""
+    if not phone or (not data.get("first_name") and not data.get("company")):
+        missing_notice = (
+            "💡 **חסרים פרטים?** אם יש מידע בצד השני של הכרטיס, "
+            "לחץ על **'📷 סרוק צד שני'** כדי להשלים ולמזג את הנתונים.\n\n---\n"
+        )
+
     person_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
 
     text = (
         f"{dup_alert}"
+        f"{missing_notice}"
         "📋 **Scanned Business Card Details:**\n\n"
         f"🏷️ **Contact Name:** `{name_preview}`\n"
         f"🏢 **Business / Company:** {data.get('company') or 'Not specified'}\n"
@@ -146,14 +153,17 @@ def render_preview(
         [InlineKeyboardButton(btn_label, callback_data="save_default")],
         [
             InlineKeyboardButton(
-                "🏷️ Assign to Event / Conference", callback_data="ask_event"
-            )
+                "📷 סרוק צד שני (מיזוג)", callback_data="scan_second_side"
+            ),
+            InlineKeyboardButton(
+                "🏷️ שייך לכנס/אירוע", callback_data="ask_event"
+            ),
         ],
         [
             InlineKeyboardButton(
-                "✏️ Edit Details", callback_data="open_edit_menu"
+                "✏️ ערוך פרטים", callback_data="open_edit_menu"
             )
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        [InlineKeyboardButton("❌ ביטול", callback_data="cancel")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
