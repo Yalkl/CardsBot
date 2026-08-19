@@ -213,13 +213,32 @@ def extract_contact_info(image_bytes: bytes) -> dict:
 
 
 def build_formatted_name(data: dict, event_name: str = None) -> str:
-    """Constructs display name: BC [Event] | Name - Country - Title."""
+    """Constructs display name: BC [Event] | Name - Organization/Country - Title."""
     full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
     name_elements = [full_name]
-    if data.get("country"):
-        name_elements.append(data.get("country"))
+
+    company = (data.get("company") or "").strip()
+    country = (data.get("country") or "").strip()
+
+    # Determine primary entity (Embassy country vs Company/Hotel)
+    entity = ""
+    if company and country:
+        # If it's an embassy (e.g. Company="Embassy of Bulgaria", Country="Bulgaria")
+        if country.lower() in company.lower():
+            entity = country
+        else:
+            entity = f"{company} ({country})"
+    elif company:
+        entity = company
+    elif country:
+        entity = country
+
+    if entity:
+        name_elements.append(entity)
+
     if data.get("job_title"):
         name_elements.append(data.get("job_title"))
+
     base_info = " - ".join([el for el in name_elements if el])
 
     if event_name:
