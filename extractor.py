@@ -15,18 +15,23 @@ def extract_contact_info(image_bytes: bytes, max_retries: int = 3) -> dict:
     {
       "first_name": "",
       "last_name": "",
-      "country": "",
       "company": "",
       "job_title": "",
+      "country": "",
       "phone": "",
       "email": "",
+      "website": "",
+      "telegram": "",
       "address": ""
     }
 
     CRITICAL RULES:
-    1. PHONE NUMBERS: Extract only ONE primary mobile or direct phone number with international country code.
-    2. DIPLOMATIC REPRESENTATION: If the card represents an Embassy/Consulate (e.g. "Embassy of Italy in Tashkent"), country MUST be the represented country ("Italy").
-    3. Missing fields should be empty strings.
+    1. BUSINESS / STORE CARDS: If there is NO individual person's name on the card (e.g. gym, spa, restaurant, clinic, hotel), leave first_name/last_name empty and extract the business/brand name into "company" (infer from text, logo, or website domain like "Scultura").
+    2. PHONE NUMBERS: Extract only ONE primary mobile or direct phone number with international country code.
+    3. WEBSITE: Extract full website address (e.g., "https://scultura.uz/").
+    4. TELEGRAM: Extract telegram username/handle (e.g., "@fitness_spa_uz").
+    5. DIPLOMATIC REPRESENTATION: If Embassy/Consulate, country MUST be the represented country.
+    6. Missing fields should be empty strings.
     """
 
     for attempt in range(max_retries):
