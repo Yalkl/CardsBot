@@ -9,27 +9,47 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 
+def merge_card_data(existing: dict, new_data: dict) -> dict:
+    """Merges newly scanned side into existing data without overwriting good fields."""
+    merged = existing.copy()
+    for key, val in new_data.items():
+        if val and not merged.get(key):
+            merged[key] = val
+        elif val and key in ["company", "job_title", "address"] and len(str(val)) > len(str(merged.get(key, ""))):
+            merged[key] = val
+    return merged
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome! Send me a business card photo.\n"
-        "I will extract the details, check your scan history for duplicates, and generate a ready-to-save Contact Card directly to your device."
+        "👋 שלום! שלח לי תמונה של כרטיס ביקור (צד אחד או שני צדדים).\n"
+        "אחלץ את הפרטים, אבדוק כפילויות ואייצר כרטיס איש קשר ישירות למכשיר."
     )
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong! Bot is alive, active, and ready.")
+    await update.message.reply_text("🏓 Pong! הבוט פעיל ומוכן לסריקה.")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    waiting_second_side = context.user_data.get("waiting_second_side", False)
+
     status_msg = await update.message.reply_text(
-        "🔍 Scanning business card & checking duplicates..."
+        "🔍 סורק כרטיס ביקור..." if not waiting_second_side else "🔍 סורק צד שני וממזג נתונים..."
     )
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
 
     try:
-        data = extract_contact_info(bytes(photo_bytes))
+        new_data = extract_contact_info(bytes(photo_bytes))
+
+        if waiting_second_side and context.user_data.get("pending_contact"):
+            data = merge_card_data(context.user_data["pending_contact"], new_data)
+            context.user_data["waiting_second_side"] = False
+        else:
+            data = new_data
+
         context.user_data["pending_contact"] = data
         context.user_data["editing_field"] = None
         context.user_data["waiting_for_event"] = False
@@ -49,7 +69,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, reply_markup=reply_markup, parse_mode="Markdown"
         )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error processing image: {str(e)}")
+        await status_msg.edit_text(f"❌ שגיאה בעיבוד התמונה: {str(e)}")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -62,16 +82,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not contact_data and query.data != "cancel":
         await query.edit_message_text(
-            "⚠️ Session expired. Please send the business card photo again."
+            "⚠️ תוקף הפעולה פג. אנא שלח את תמונת הכרטיס מחדש."
         )
         return
 
-    # 1. Save Contact & Update History
+    # 1. Save Default
     if query.data == "save_default":
         phone = clean_phone_number(contact_data.get("phone", ""))
         if not phone:
             await query.edit_message_text(
-                "❌ No phone number detected. Tap 'Edit Details' to add a phone number."
+                "❌ לא זוהה מספר טלפון. לחץ על 'ערוך פרטים' כדי להוסיף מספר, או סרוק את הצד השני."
             )
             return
 
@@ -89,61 +109,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         record_saved_contact(user_id, contact_data)
 
         await query.edit_message_text(
-            f"✅ Contact `{formatted_name}` generated! Tap the card above to save it to your phone.",
+            f"✅ איש הקשר `{formatted_name}` נוצר בהצלחה! לחץ עליו למעלה לשמירה בטלפון.",
             parse_mode="Markdown",
         )
         context.user_data.clear()
 
-    # 2. Ask Event Name
+    # 2. Scan Second Side
+    elif query.data == "scan_second_side":
+        context.user_data["waiting_second_side"] = True
+        await query.edit_message_text(
+            "📷 **שלח עכשיו תמונה של הצד השני של הכרטיס:**\n"
+            "הבוט ימזג את המידע מהצד השני עם הנתונים שכבר נסרקו.",
+            parse_mode="Markdown",
+        )
+
+    # 3. Assign Event Name
     elif query.data == "ask_event":
         context.user_data["waiting_for_event"] = True
         context.user_data["editing_field"] = None
         await query.edit_message_text(
-            "✍️ **Please type the Event / Conference name in chat:**\n"
-            "(e.g., `Grape Conference 2026` or `Tashkent B2B`)",
+            "✍️ **הקלד את שם הכנס / האירוע בצ'אט:**\n"
+            "(לדוגמה: `Grape Conference 2026` או `Tashkent B2B`)",
             parse_mode="Markdown",
         )
 
-    # 3. Edit Menu
+    # 4. Edit Menu
     elif query.data == "open_edit_menu":
         edit_keyboard = [
             [
                 InlineKeyboardButton(
-                    "📞 Edit Phone", callback_data="edit_field_phone"
+                    "📞 ערוך טלפון", callback_data="edit_field_phone"
                 ),
                 InlineKeyboardButton(
-                    "👤 Edit Name", callback_data="edit_field_name"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "🏢 Edit Company", callback_data="edit_field_company"
-                ),
-                InlineKeyboardButton(
-                    "💼 Edit Title", callback_data="edit_field_job_title"
+                    "👤 ערוך שם", callback_data="edit_field_name"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "✉️ Edit Email", callback_data="edit_field_email"
+                    "🏢 ערוך חברה/עסק", callback_data="edit_field_company"
                 ),
                 InlineKeyboardButton(
-                    "🌍 Edit Country", callback_data="edit_field_country"
+                    "💼 ערוך תפקיד", callback_data="edit_field_job_title"
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    "🔙 Back to Preview", callback_data="back_to_preview"
+                    "✉️ ערוך אימייל", callback_data="edit_field_email"
+                ),
+                InlineKeyboardButton(
+                    "🌐 ערוך אתר", callback_data="edit_field_website"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔙 חזרה לתצוגה", callback_data="back_to_preview"
                 )
             ],
         ]
         await query.edit_message_text(
-            "✏️ **Select a field to modify:**",
+            "✏️ **בחר שדה לעריכה:**",
             reply_markup=InlineKeyboardMarkup(edit_keyboard),
             parse_mode="Markdown",
         )
 
-    # 4. Field Selected
+    # 5. Field Selected
     elif query.data.startswith("edit_field_"):
         field = query.data.replace("edit_field_", "")
         context.user_data["editing_field"] = field
@@ -155,23 +184,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await query.edit_message_text(
-            f"✏️ **Editing {field.replace('_', ' ').capitalize()}:**\n"
-            f"Current value: `{current_val}`\n\n"
-            "👉 Please reply with the new value in chat:",
+            f"✏️ **עריכת {field}:**\n"
+            f"ערך נוכחי: `{current_val or 'ריק'}`\n\n"
+            "👉 השב בצ'אט עם הערך החדש:",
             parse_mode="Markdown",
         )
 
-    # 5. Back to Preview
+    # 6. Back to Preview
     elif query.data == "back_to_preview":
         text, reply_markup = render_preview(contact_data, duplicate_info)
         await query.edit_message_text(
             text, reply_markup=reply_markup, parse_mode="Markdown"
         )
 
-    # 6. Cancel
+    # 7. Cancel
     elif query.data == "cancel":
         context.user_data.clear()
-        await query.edit_message_text("🚫 Operation cancelled.")
+        await query.edit_message_text("🚫 הפעולה בוטלה.")
 
 
 async def handle_text_input(
@@ -186,7 +215,7 @@ async def handle_text_input(
 
     if not contact_data:
         await update.message.reply_text(
-            "No active card session. Send a photo of a business card to begin."
+            "אין כרטיס פעיל כרגע. שלח תמונה של כרטיס ביקור כדי להתחיל."
         )
         return
 
@@ -214,8 +243,7 @@ async def handle_text_input(
 
         text, reply_markup = render_preview(contact_data, duplicate_info)
         await update.message.reply_text(
-            f"✅ **{editing_field.replace('_', ' ').capitalize()} updated!**\n\n"
-            + text,
+            f"✅ השדה עודכן בהצלחה!\n\n" + text,
             reply_markup=reply_markup,
             parse_mode="Markdown",
         )
@@ -227,7 +255,7 @@ async def handle_text_input(
         phone = clean_phone_number(contact_data.get("phone", ""))
         if not phone:
             await update.message.reply_text(
-                "❌ No phone number found on card. Please edit details and add a phone number first."
+                "❌ לא נמצא מספר טלפון. אנא ערוך פרטים או סרוק את הצד השני."
             )
             return
 
@@ -245,7 +273,7 @@ async def handle_text_input(
         record_saved_contact(user_id, contact_data)
 
         await update.message.reply_text(
-            f"✅ Contact `{formatted_name}` generated and saved to history! Tap above to save.",
+            f"✅ איש הקשר `{formatted_name}` נוצר ונשמר בהיסטוריה!",
             parse_mode="Markdown",
         )
         context.user_data.clear()
