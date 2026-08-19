@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -24,13 +25,106 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+DB_PATH = "contacts_history.db"
+
+
+# --- Database Management (Per Telegram User) ---
+
+
+def init_db():
+    """Initializes SQLite table for tracking scanned contacts per user."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            full_name TEXT,
+            phone TEXT,
+            email TEXT,
+            scanned_date TEXT
+        )
+    """
+    )
+    conn.commit()
+    conn.close()
 
 
 def clean_phone_number(phone_str: str) -> str:
-    """Cleans phone numbers into a standard international format."""
+    """Cleans phone numbers into a standard format."""
     if not phone_str:
         return ""
     return re.sub(r"[^\d+]", "", phone_str)
+
+
+def check_duplicate_contact(user_id: int, phone: str, email: str):
+    """Checks if this specific user already scanned a contact with matching phone or email."""
+    cleaned_phone = clean_phone_number(phone)
+    digits_only = re.sub(r"\D", "", cleaned_phone)
+    cleaned_email = email.strip().lower() if email else ""
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT full_name, phone, email, scanned_date FROM user_contacts WHERE user_id = ?",
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row_name, row_phone, row_email, row_date in rows:
+        row_digits = re.sub(r"\D", "", clean_phone_number(row_phone))
+        # Match by last 8 digits of phone or identical email
+        if digits_only and row_digits:
+            if (
+                digits_only == row_digits
+                or digits_only.endswith(row_digits[-8:])
+                or row_digits.endswith(digits_only[-8:])
+            ):
+                return {
+                    "name": row_name,
+                    "phone": row_phone,
+                    "date": row_date,
+                    "match_type": "Phone",
+                }
+
+        if (
+            cleaned_email
+            and row_email
+            and cleaned_email == row_email.strip().lower()
+        ):
+            return {
+                "name": row_name,
+                "email": row_email,
+                "date": row_date,
+                "match_type": "Email",
+            }
+
+    return None
+
+
+def record_saved_contact(user_id: int, data: dict):
+    """Saves the scanned contact into database for future duplicate checks."""
+    full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
+    phone = clean_phone_number(data.get("phone", ""))
+    email = data.get("email", "").strip()
+    today_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO user_contacts (user_id, full_name, phone, email, scanned_date)
+        VALUES (?, ?, ?, ?, ?)
+    """,
+        (user_id, full_name, phone, email, today_str),
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- Contact Card Formatting ---
 
 
 def extract_contact_info(image_bytes: bytes) -> dict:
@@ -67,7 +161,7 @@ def extract_contact_info(image_bytes: bytes) -> dict:
 
 
 def build_formatted_name(data: dict, event_name: str = None) -> str:
-    """Constructs the standard display name: BC [Event] | Name - Country - Title."""
+    """Constructs display name: BC [Event] | Name - Country - Title."""
     full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
     name_elements = [full_name]
     if data.get("country"):
@@ -82,7 +176,7 @@ def build_formatted_name(data: dict, event_name: str = None) -> str:
 
 
 def generate_vcard(data: dict, event_name: str = None) -> str:
-    """Generates standard vCard 3.0 string with formatted name, metadata, and WhatsApp note."""
+    """Generates standard vCard 3.0 string."""
     formatted_name = build_formatted_name(data, event_name)
     phone = clean_phone_number(data.get("phone", ""))
     digits_only = re.sub(r"\D", "", phone)
@@ -122,14 +216,25 @@ def generate_vcard(data: dict, event_name: str = None) -> str:
     return "\n".join(lines)
 
 
-def render_preview(data: dict) -> tuple[str, InlineKeyboardMarkup]:
-    """Builds the preview message and inline action buttons."""
+def render_preview(
+    data: dict, duplicate_info: dict = None
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Builds preview text with duplicate warning if detected."""
     name_preview = build_formatted_name(data)
     phone = clean_phone_number(data.get("phone", ""))
     digits_only = re.sub(r"\D", "", phone)
     wa_preview = f"https://wa.me/{digits_only}" if digits_only else "Not detected"
 
+    dup_alert = ""
+    if duplicate_info:
+        dup_alert = (
+            f"⚠️ **Duplicate Found in your History!**\n"
+            f"You previously scanned this contact on **{duplicate_info['date']}** "
+            f"as `{duplicate_info['name']}` ({duplicate_info['match_type']} matched).\n\n---\n"
+        )
+
     text = (
+        f"{dup_alert}"
         "📋 **Scanned Business Card Details:**\n\n"
         f"🏷️ **Contact Name:** `{name_preview}`\n"
         f"👤 **Person:** {data.get('first_name', '')} {data.get('last_name', '')}\n"
@@ -140,15 +245,17 @@ def render_preview(data: dict) -> tuple[str, InlineKeyboardMarkup]:
         f"💬 **WhatsApp:** {wa_preview}\n"
         f"✉️ **Email:** {data.get('email') or 'Not specified'}\n"
         f"📍 **Address:** {data.get('address') or 'Not specified'}\n\n"
-        "How would you like to save this contact?"
+        "How would you like to proceed?"
+    )
+
+    btn_label = (
+        "🔄 Update / Send Contact Anyway"
+        if duplicate_info
+        else "✅ Save Default (BC | ...)"
     )
 
     keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ Save Default (BC | ...)", callback_data="save_default"
-            )
-        ],
+        [InlineKeyboardButton(btn_label, callback_data="save_default")],
         [
             InlineKeyboardButton(
                 "🏷️ Assign to Event / Conference", callback_data="ask_event"
@@ -164,16 +271,20 @@ def render_preview(data: dict) -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(keyboard)
 
 
+# --- Handlers ---
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome! Send me a photo of a business card.\n"
-        "I will extract the details and send a formatted Contact Card directly to your chat."
+        "👋 Welcome! Send me a business card photo.\n"
+        "I will extract the details, check your scan history for duplicates, and generate a ready-to-save Contact Card."
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     status_msg = await update.message.reply_text(
-        "🔍 Scanning business card with Gemini 3.6 Flash..."
+        "🔍 Scanning business card & checking duplicates..."
     )
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
@@ -184,7 +295,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["editing_field"] = None
         context.user_data["waiting_for_event"] = False
 
-        text, reply_markup = render_preview(data)
+        duplicate_info = check_duplicate_contact(
+            user_id, data.get("phone", ""), data.get("email", "")
+        )
+        context.user_data["duplicate_info"] = duplicate_info
+
+        text, reply_markup = render_preview(data, duplicate_info)
         await status_msg.delete()
         await update.message.reply_text(
             text, reply_markup=reply_markup, parse_mode="Markdown"
@@ -197,7 +313,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    user_id = update.effective_user.id
     contact_data = context.user_data.get("pending_contact")
+    duplicate_info = context.user_data.get("duplicate_info")
 
     if not contact_data and query.data != "cancel":
         await query.edit_message_text(
@@ -205,18 +323,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 1. Save Default
+    # 1. Save Contact & Update DB
     if query.data == "save_default":
         phone = clean_phone_number(contact_data.get("phone", ""))
         if not phone:
             await query.edit_message_text(
-                "❌ No phone number detected. Tap 'Edit Details' to provide a phone number."
+                "❌ No phone number detected. Tap 'Edit Details' to add a phone number."
             )
             return
 
         formatted_name = build_formatted_name(contact_data)
         vcard_text = generate_vcard(contact_data)
 
+        # Send contact to Telegram chat
         await context.bot.send_contact(
             chat_id=query.message.chat_id,
             phone_number=phone,
@@ -224,8 +343,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name="",
             vcard=vcard_text,
         )
+
+        # Store in user's history
+        record_saved_contact(user_id, contact_data)
+
         await query.edit_message_text(
-            f"✅ Contact `{formatted_name}` generated! Tap the card above to save it to your phone.",
+            f"✅ Contact `{formatted_name}` generated and saved to your scan history! Tap the card above to save it to your phone.",
             parse_mode="Markdown",
         )
         context.user_data.clear()
@@ -240,7 +363,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # 3. Open Edit Menu
+    # 3. Edit Menu
     elif query.data == "open_edit_menu":
         edit_keyboard = [
             [
@@ -279,7 +402,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # 4. Field Selected for Editing
+    # 4. Field Selected
     elif query.data.startswith("edit_field_"):
         field = query.data.replace("edit_field_", "")
         context.user_data["editing_field"] = field
@@ -297,9 +420,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-    # 5. Return to Main Preview
+    # 5. Back to Preview
     elif query.data == "back_to_preview":
-        text, reply_markup = render_preview(contact_data)
+        text, reply_markup = render_preview(contact_data, duplicate_info)
         await query.edit_message_text(
             text, reply_markup=reply_markup, parse_mode="Markdown"
         )
@@ -313,7 +436,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text_input(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    """Handles text replies for editing fields or entering event names."""
+    """Handles user replies for editing fields or entering event names."""
+    user_id = update.effective_user.id
     user_input = update.message.text.strip()
     contact_data = context.user_data.get("pending_contact")
     editing_field = context.user_data.get("editing_field")
@@ -338,7 +462,13 @@ async def handle_text_input(
 
         context.user_data["editing_field"] = None
 
-        text, reply_markup = render_preview(contact_data)
+        # Re-check duplicate with updated field
+        duplicate_info = check_duplicate_contact(
+            user_id, contact_data.get("phone", ""), contact_data.get("email", "")
+        )
+        context.user_data["duplicate_info"] = duplicate_info
+
+        text, reply_markup = render_preview(contact_data, duplicate_info)
         await update.message.reply_text(
             f"✅ **{editing_field.replace('_', ' ').capitalize()} updated!**\n\n"
             + text,
@@ -367,14 +497,18 @@ async def handle_text_input(
             last_name="",
             vcard=vcard_text,
         )
+
+        record_saved_contact(user_id, contact_data)
+
         await update.message.reply_text(
-            f"✅ Contact `{formatted_name}` generated! Tap above to save.",
+            f"✅ Contact `{formatted_name}` generated and saved to history! Tap above to save.",
             parse_mode="Markdown",
         )
         context.user_data.clear()
 
 
 def main():
+    init_db()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -384,7 +518,9 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
     )
 
-    print("🤖 Telegram Business Card Bot (v3.6 Flash) is running...")
+    print(
+        "🤖 Telegram Business Card Bot (v3.6 Flash + SQLite Duplicates) is running..."
+    )
     app.run_polling()
 
 
