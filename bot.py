@@ -609,9 +609,10 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input)
     )
 
-    print("🤖 Telegram Business Card Bot (Postgres/SQLite + Duplicates) is running...")
-    app.run_polling()
+print("🤖 Telegram Business Card Bot (Postgres/SQLite + Duplicates) is running...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
+    
