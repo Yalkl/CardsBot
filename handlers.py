@@ -117,9 +117,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Scan Second Side
     elif query.data == "scan_second_side":
         context.user_data["waiting_second_side"] = True
+        context.user_data["editing_field"] = None
+        context.user_data["waiting_for_event"] = False
+
+        back_keyboard = [[InlineKeyboardButton("🔙 Back to Preview", callback_data="back_to_preview")]]
         await query.edit_message_text(
             "📷 **Please send a photo of the back side of the card:**\n"
             "The bot will automatically merge the new information with the existing card.",
+            reply_markup=InlineKeyboardMarkup(back_keyboard),
             parse_mode="Markdown",
         )
 
@@ -127,14 +132,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "ask_event":
         context.user_data["waiting_for_event"] = True
         context.user_data["editing_field"] = None
+        context.user_data["waiting_second_side"] = False
+
+        back_keyboard = [[InlineKeyboardButton("🔙 Back to Preview", callback_data="back_to_preview")]]
         await query.edit_message_text(
             "✍️ **Please type the Event / Conference name in chat:**\n"
             "(e.g., `Grape Conference 2026` or `Tashkent B2B`)",
+            reply_markup=InlineKeyboardMarkup(back_keyboard),
             parse_mode="Markdown",
         )
 
     # 4. Edit Menu
     elif query.data == "open_edit_menu":
+        context.user_data["editing_field"] = None
+        context.user_data["waiting_for_event"] = False
+        context.user_data["waiting_second_side"] = False
+
         edit_keyboard = [
             [
                 InlineKeyboardButton(
@@ -176,6 +189,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("edit_field_"):
         field = query.data.replace("edit_field_", "")
         context.user_data["editing_field"] = field
+        context.user_data["waiting_for_event"] = False
+        context.user_data["waiting_second_side"] = False
 
         current_val = (
             f"{contact_data.get('first_name', '')} {contact_data.get('last_name', '')}".strip()
@@ -183,15 +198,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else contact_data.get(field, "")
         )
 
+        back_keyboard = [
+            [InlineKeyboardButton("🔙 Back to Edit Menu", callback_data="open_edit_menu")],
+            [InlineKeyboardButton("🔙 Back to Preview", callback_data="back_to_preview")],
+        ]
+
         await query.edit_message_text(
             f"✏️ **Editing {field.capitalize()}:**\n"
             f"Current value: `{current_val or 'Empty'}`\n\n"
             "👉 Please reply with the new value in chat:",
+            reply_markup=InlineKeyboardMarkup(back_keyboard),
             parse_mode="Markdown",
         )
 
     # 6. Back to Preview
     elif query.data == "back_to_preview":
+        context.user_data["editing_field"] = None
+        context.user_data["waiting_for_event"] = False
+        context.user_data["waiting_second_side"] = False
+
         text, reply_markup = render_preview(contact_data, duplicate_info)
         await query.edit_message_text(
             text, reply_markup=reply_markup, parse_mode="Markdown"
