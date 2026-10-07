@@ -126,8 +126,12 @@ def render_preview(
         dup_alert = (
             f"⚠️ **Duplicate Found in your History!**\n"
             f"You previously scanned this contact on **{duplicate_info['date']}** "
-            f"as `{duplicate_info['name']}` ({duplicate_info['match_type']} matched).\n\n---\n"
+            f"as `{duplicate_info['name']}` ({duplicate_info['match_type']} matched).\n"
         )
+        if duplicate_info.get("by"):
+            saved = "✅ saved to phone" if duplicate_info.get("saved") else "📵 not marked as saved to phone"
+            dup_alert += f"Scanned by {duplicate_info['by']} · {saved}\n"
+        dup_alert += "\n---\n"
 
     missing_notice = ""
     if not phone or (not data.get("first_name") and not data.get("company")):
