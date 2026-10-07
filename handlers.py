@@ -5,8 +5,83 @@ from database import (
 )
 from extractor import extract_contact_info
 from formatters import build_formatted_name, generate_vcard, render_preview
+from sheets import append_contact, notes_enabled_for, sheets_enabled_for
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
+
+NOTE_MAX_LEN = 500
+
+
+def _last_notes(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """Last note per user, kept in bot memory so "Same as last" survives user_data.clear()."""
+    return context.bot_data.setdefault("last_note", {})
+
+
+async def ask_for_note(message, context: ContextTypes.DEFAULT_TYPE, user_id: int, edit: bool):
+    """Second step of saving: one short question, answer by text or a button."""
+    context.user_data["waiting_for_note"] = True
+    context.user_data["editing_field"] = None
+    context.user_data["waiting_for_event"] = False
+    context.user_data["waiting_second_side"] = False
+
+    keyboard = []
+    last = _last_notes(context).get(user_id)
+    if last:
+        short = last if len(last) <= 30 else last[:29] + "…"
+        keyboard.append([InlineKeyboardButton(f"🔁 Same as last: {short}", callback_data="note_repeat")])
+    keyboard.append([InlineKeyboardButton("⏭ Skip", callback_data="note_skip")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Preview", callback_data="back_to_preview")])
+
+    text = "📝 Note? Where you met, what you talked about.\nType it in chat, or tap Skip."
+    if edit:
+        sent = await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        sent = await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data["note_prompt"] = (sent.chat_id, sent.message_id)
+
+
+async def finalize_save(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, note: str | None) -> str:
+    """Sends the contact card, records it, and appends it to the sheet when enabled.
+
+    Returns the confirmation text. Clears the pending session.
+    """
+    contact_data = context.user_data["pending_contact"]
+    event_name = context.user_data.get("pending_event")
+    phone = clean_phone_number(contact_data.get("phone", ""))
+
+    formatted_name = build_formatted_name(contact_data, event_name=event_name)
+    vcard_text = generate_vcard(contact_data, event_name=event_name, note=note)
+
+    await context.bot.send_contact(
+        chat_id=chat_id,
+        phone_number=phone,
+        first_name=formatted_name,
+        last_name="",
+        vcard=vcard_text,
+    )
+    record_saved_contact(user.id, contact_data)
+
+    if note:
+        _last_notes(context)[user.id] = note
+
+    result = f"✅ Contact {formatted_name} generated! Tap above to save it to your phone."
+    if sheets_enabled_for(user.id):
+        ok = await append_contact(user.first_name or str(user.id), contact_data, event_name, note)
+        result += "\n📊 Added to the shared sheet." if ok else "\n⚠️ Could not add to the shared sheet. The contact card above is fine."
+
+    context.user_data.clear()
+    return result
+
+
+async def _close_note_prompt(context: ContextTypes.DEFAULT_TYPE):
+    """Removes the buttons from the note question once it has been answered."""
+    prompt = context.user_data.get("note_prompt")
+    if not prompt:
+        return
+    try:
+        await context.bot.edit_message_reply_markup(chat_id=prompt[0], message_id=prompt[1], reply_markup=None)
+    except Exception:
+        pass
 
 
 def merge_card_data(existing: dict, new_data: dict) -> dict:
@@ -31,9 +106,22 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏓 Pong! Bot is alive, active, and ready.")
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    sheet = "on" if sheets_enabled_for(user_id) else ("notes only" if notes_enabled_for(user_id) else "off")
+    await update.message.reply_text(f"🆔 Your Telegram ID: {user_id}\n📊 Shared sheet: {sheet}")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     waiting_second_side = context.user_data.get("waiting_second_side", False)
+
+    # Next card arrived while the previous one waits for a note: save the previous one without a note.
+    if context.user_data.get("waiting_for_note") and context.user_data.get("pending_contact"):
+        await _close_note_prompt(context)
+        saved_text = await finalize_save(context, update.message.chat_id, update.effective_user, None)
+        await update.message.reply_text(saved_text + "\n(Saved without a note.)")
+        waiting_second_side = False
 
     status_msg = await update.message.reply_text(
         "🔍 Scanning business card..." if not waiting_second_side else "🔍 Scanning back side & merging details..."
@@ -53,6 +141,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pending_contact"] = data
         context.user_data["editing_field"] = None
         context.user_data["waiting_for_event"] = False
+        context.user_data["waiting_for_note"] = False
 
         duplicate_info = check_duplicate_contact(
             user_id,
@@ -95,6 +184,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if notes_enabled_for(user_id):
+            await ask_for_note(query.message, context, user_id, edit=True)
+            return
+
         formatted_name = build_formatted_name(contact_data)
         vcard_text = generate_vcard(contact_data)
 
@@ -113,6 +206,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         context.user_data.clear()
+
+    # 1b. Note step answered by a button
+    elif query.data in ("note_skip", "note_repeat"):
+        if not context.user_data.get("waiting_for_note"):
+            await query.edit_message_text("⚠️ Session expired. Please send the business card photo again.")
+            return
+        note = _last_notes(context).get(user_id) if query.data == "note_repeat" else None
+        result = await finalize_save(context, query.message.chat_id, update.effective_user, note)
+        await query.edit_message_text(result)
 
     # 2. Scan Second Side
     elif query.data == "scan_second_side":
@@ -216,6 +318,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["editing_field"] = None
         context.user_data["waiting_for_event"] = False
         context.user_data["waiting_second_side"] = False
+        context.user_data["waiting_for_note"] = False
+        context.user_data.pop("pending_event", None)
 
         text, reply_markup = render_preview(contact_data, duplicate_info)
         await query.edit_message_text(
@@ -242,6 +346,13 @@ async def handle_text_input(
         await update.message.reply_text(
             "No active card session. Send a photo of a business card to begin."
         )
+        return
+
+    # Handle Note Input
+    if context.user_data.get("waiting_for_note"):
+        await _close_note_prompt(context)
+        result = await finalize_save(context, update.message.chat_id, update.effective_user, user_input[:NOTE_MAX_LEN])
+        await update.message.reply_text(result)
         return
 
     # Handle Field Editing
@@ -282,6 +393,11 @@ async def handle_text_input(
             await update.message.reply_text(
                 "❌ No phone number found. Please edit details or scan the back side."
             )
+            return
+
+        if notes_enabled_for(user_id):
+            context.user_data["pending_event"] = event_name
+            await ask_for_note(update.message, context, user_id, edit=False)
             return
 
         formatted_name = build_formatted_name(contact_data, event_name=event_name)

@@ -20,6 +20,7 @@ def main():
     # Register Handlers
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("ping", handlers.ping))
+    app.add_handler(CommandHandler("myid", handlers.myid))
     app.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
     app.add_handler(CallbackQueryHandler(handlers.handle_callback))
     app.add_handler(

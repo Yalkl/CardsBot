@@ -41,7 +41,18 @@ def build_formatted_name(data: dict, event_name: str = None) -> str:
     return f"BC | {base_info}"
 
 
-def generate_vcard(data: dict, event_name: str = None) -> str:
+def _vcard_escape(text: str) -> str:
+    """Escapes free text for a vCard 3.0 value (backslash, comma, semicolon, newline)."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def generate_vcard(data: dict, event_name: str = None, note: str = None) -> str:
     """Generates standard vCard 3.0 string with website, WhatsApp, and Telegram."""
     formatted_name = build_formatted_name(data, event_name)
     phone = clean_phone_number(data.get("phone", ""))
@@ -65,7 +76,9 @@ def generate_vcard(data: dict, event_name: str = None) -> str:
     if website:
         notes.append(f"🌐 Website: {website}")
     if event_name:
-        notes.insert(0, f"🏷️ Event: {event_name}")
+        notes.insert(0, f"🏷️ Event: {_vcard_escape(event_name)}")
+    if note:
+        notes.insert(0, f"📝 Note: {_vcard_escape(note)}")
     note_content = "\\n".join(notes)
 
     lines = [
