@@ -3,6 +3,7 @@
 
 import asyncio
 import io
+import logging
 from datetime import date, datetime
 from html import escape
 
@@ -14,10 +15,12 @@ import cards
 import config
 import database as db
 import google_auth
-from extractor import extract_contact_info, parse_question, transcribe_audio
+from extractor import GeminiBusy, extract_contact_info, parse_question, transcribe_audio
 from formatters import build_display_name, edit_menu, generate_vcard, render_preview, render_results
 
 HTML = "HTML"
+log = logging.getLogger("cardsbot")
+BUSY = "⏳ Gemini עמוס כרגע (מגבלת שימוש לדקה). נסו שוב בעוד דקה."
 NOTE_MAX_LEN = 500
 
 WELCOME = (
@@ -93,8 +96,17 @@ async def google_for(update_or_message, user_id: int):
         return None
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """Last resort: log the error type. Pressing a button twice ("message is not modified") is not an error."""
+    err = context.error
+    if "Message is not modified" in str(err):
+        return
+    log.error("unhandled %s: %s", type(err).__name__, str(err)[:200])
+
+
 async def google_failed(message, user_id: int, err: Exception):
     """A Google call failed: a revoked or expired connection needs /connect; anything else, try again."""
+    log.warning("google call failed: %s", type(err).__name__)
     if isinstance(err, (RefreshError, google_auth.GoogleNotConnected)):
         db.clear_google(user_id)
         await message.reply_text("🔌 החיבור לגוגל פג או בוטל. התחברו מחדש: /connect")
@@ -207,7 +219,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_bytes = bytes(await photo_file.download_as_bytearray())
     try:
         new_data = await asyncio.to_thread(extract_contact_info, photo_bytes)
-    except Exception:
+    except GeminiBusy:
+        await status.edit_text(BUSY)
+        return
+    except Exception as e:
+        log.warning("card read failed: %s", type(e).__name__)
         await status.edit_text("❌ לא הצלחתי לקרוא את הכרטיס. נסו שוב, אולי עם תמונה חדה יותר.")
         return
 
@@ -505,7 +521,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f = await voice.get_file()
         audio = bytes(await f.download_as_bytearray())
         text = await asyncio.to_thread(transcribe_audio, audio, getattr(voice, "mime_type", None) or "audio/ogg")
-    except Exception:
+    except GeminiBusy:
+        await status.edit_text(BUSY)
+        return
+    except Exception as e:
+        log.warning("transcription failed: %s", type(e).__name__)
         await status.edit_text("⚠️ לא הצלחתי לתמלל. נסו שוב או כתבו.")
         return
     if not text:

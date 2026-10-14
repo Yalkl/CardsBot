@@ -1,3 +1,5 @@
+import logging
+
 import config
 from database import init_db
 import handlers
@@ -24,6 +26,8 @@ async def post_shutdown(app: Application):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # every Telegram poll would be logged otherwise
     init_db()
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
 
@@ -39,6 +43,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handlers.handle_voice))
     app.add_handler(CallbackQueryHandler(handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text_input))
+    app.add_error_handler(handlers.on_error)
 
     print("CardsBot is running")
     app.run_polling(drop_pending_updates=True)

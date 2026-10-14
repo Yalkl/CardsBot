@@ -549,6 +549,16 @@ class Bot_(unittest.TestCase):
         run(text(self.admin, ADMIN, "+359 (2) 111-2222"))
         self.assertIn("☎️ +35921112222", last("reply", ADMIN)[2])
 
+    def test_busy_gemini_says_so_instead_of_blaming_the_photo(self):
+        def busy(_b):
+            raise extractor.GeminiBusy()
+        handlers.extract_contact_info = busy
+        try:
+            run(handlers.handle_photo(upd(ADMIN), self.admin))
+        finally:
+            handlers.extract_contact_info = lambda _b: dict(next_card.pop(0))
+        self.assertIn("Gemini עמוס", last("edit", ADMIN)[2])
+
     def test_sheet_command(self):
         run(command(handlers.sheet_cmd, self.admin, ADMIN))
         self.assertIn("docs.google.com/spreadsheets", last("reply", ADMIN)[2])
@@ -744,6 +754,51 @@ class OAuthCallbackTests(unittest.IsolatedAsyncioTestCase):
         state = google_auth.new_login_url(ADMIN).split("state=")[1]
         r = await self.client.get(f"/oauth/callback?state={state}&error=access_denied")
         self.assertIn("בוטלה", last("message", ADMIN)[2])
+
+
+class GeminiFallback(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        extractor.time.sleep = lambda _s: None
+
+    def _client(self, outcomes):
+        """outcomes: per model, an Exception to raise or a text to return."""
+        def gen(model, contents, config=None):
+            self.calls.append(model)
+            out = outcomes[len(self.calls) - 1]
+            if isinstance(out, Exception):
+                raise out
+            return SimpleNamespace(text=out)
+        extractor.gemini_client = SimpleNamespace(models=SimpleNamespace(generate_content=gen))
+
+    def test_next_model_when_quota_is_reached(self):
+        self._client([RuntimeError("429 RESOURCE_EXHAUSTED"), '{"first_name": "Barbara", "phone": null}'])
+        data = extractor.extract_contact_info(_png())
+        self.assertEqual(self.calls, list(extractor.MODELS[:2]))
+        self.assertEqual(data, {"first_name": "Barbara", "phone": ""})
+
+    def test_all_busy_raises_gemini_busy(self):
+        self._client([RuntimeError("429")] * len(extractor.MODELS))
+        with self.assertRaises(extractor.GeminiBusy):
+            extractor.extract_contact_info(_png())
+
+    def test_other_errors_do_not_try_more_models(self):
+        self._client([ValueError("bad request 400")])
+        with self.assertRaises(ValueError):
+            extractor.extract_contact_info(_png())
+        self.assertEqual(len(self.calls), 1)
+
+    def test_list_response_is_unwrapped(self):
+        self._client(['[{"first_name": "Barbara"}]'])
+        self.assertEqual(extractor.extract_contact_info(_png())["first_name"], "Barbara")
+
+
+def _png() -> bytes:
+    from PIL import Image
+    import io as _io
+    buf = _io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+    return buf.getvalue()
 
 
 class QuestionParser(unittest.TestCase):

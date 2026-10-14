@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import re
 import time
 from datetime import date
@@ -7,8 +8,44 @@ from config import gemini_client
 from google.genai import types
 from PIL import Image
 
+log = logging.getLogger("cardsbot.gemini")
 
-def extract_contact_info(image_bytes: bytes, max_retries: int = 3) -> dict:
+# Tried in order. Each model has its own quota, so when the free-tier per-minute limit of one is reached
+# (error 429), the next one usually still answers (checked on the bot's key, 14.10.2026).
+MODELS = ("gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite")
+
+
+class GeminiBusy(Exception):
+    """Every model answered "too many requests" or "unavailable": try again in a minute."""
+
+
+def _transient(e: Exception) -> bool:
+    msg = str(e)
+    return any(code in msg for code in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "500", "INTERNAL"))
+
+
+def generate(contents, config=None):
+    """generate_content with fallback to the next model on a quota/availability error.
+
+    Logs only the model and the error type, never the content. Raises GeminiBusy if all are busy.
+    """
+    last = None
+    for attempt, model in enumerate(MODELS):
+        try:
+            return gemini_client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:
+            if not _transient(e):
+                log.warning("gemini %s failed: %s", model, type(e).__name__)
+                raise
+            log.warning("gemini %s busy (%s), trying the next model", model, str(e)[:40])
+            last = e
+            if attempt == len(MODELS) - 1:
+                break
+            time.sleep(1)
+    raise GeminiBusy() from last
+
+
+def extract_contact_info(image_bytes: bytes) -> dict:
     """Extracts structured fields from business card using Gemini Vision with Russian-to-English translation & retry logic."""
     image = Image.open(io.BytesIO(image_bytes))
     prompt = """
@@ -67,26 +104,13 @@ def extract_contact_info(image_bytes: bytes, max_retries: int = 3) -> dict:
     7. Missing fields should be empty strings.
     """
 
-    for attempt in range(max_retries):
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=[image, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            err_msg = str(e)
-            is_transient = any(
-                code in err_msg for code in ["503", "UNAVAILABLE", "429", "500"]
-            )
-            if is_transient and attempt < max_retries - 1:
-                time.sleep((attempt + 1) * 3)
-                continue
-            raise e
+    response = generate([image, prompt], types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1))
+    data = json.loads(response.text)
+    if isinstance(data, list):  # some models wrap the object in a list
+        data = data[0] if data and isinstance(data[0], dict) else {}
+    if not isinstance(data, dict):
+        raise ValueError("unexpected response shape")
+    return {k: ("" if v is None else str(v)) for k, v in data.items()}
 
 
 def _raw_words(question: str) -> list[str]:
@@ -154,11 +178,7 @@ def parse_question(question: str, today: date | None = None) -> dict:
     fallback = {"action": "search", "date_from": None, "date_to": None, "terms": _raw_words(question),
                 "who": [], "changes": {}, "note": None, "note_mode": "append"}
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash",
-            contents=[prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0),
-        )
+        response = generate([prompt], types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0))
         out = json.loads(response.text)
         words = lambda key, n: [str(t)[:40] for t in (out.get(key) or []) if isinstance(t, (str, int))][:n]  # noqa: E731
         d_from = out.get("date_from") if isinstance(out.get("date_from"), str) and _DATE.match(out["date_from"]) else None
@@ -184,9 +204,5 @@ def transcribe_audio(audio: bytes, mime_type: str = "audio/ogg") -> str:
         "Transcribe this voice message exactly as spoken. It is usually in Hebrew and may contain names, companies "
         "or places in other languages. Return only the transcription, with no comments. If there is no speech, return nothing."
     )
-    response = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=[types.Part.from_bytes(data=audio, mime_type=mime_type), prompt],
-        config=types.GenerateContentConfig(temperature=0.0),
-    )
+    response = generate([types.Part.from_bytes(data=audio, mime_type=mime_type), prompt], types.GenerateContentConfig(temperature=0.0))
     return (response.text or "").strip()
