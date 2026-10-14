@@ -203,12 +203,14 @@ async def voice(ctx, uid, spoken):
     await handlers.handle_voice(u, ctx)
 
 
-def search_filter(terms=None, date_from=None, date_to=None):
-    return {"action": "search", "date_from": date_from, "date_to": date_to, "terms": terms or [], "who": [], "changes": {}, "note": None, "note_mode": "append"}
+def search_filter(terms=None, date_from=None, date_to=None, groups=None):
+    groups = groups if groups is not None else ([terms] if terms else [])
+    return {"action": "search", "date_from": date_from, "date_to": date_to, "groups": groups, "terms": [t for g in groups for t in g],
+            "who": [], "changes": {}, "note": None, "note_mode": "append"}
 
 
 def update_filter(who, changes=None, note=None, note_mode="append"):
-    return {"action": "update", "date_from": None, "date_to": None, "terms": [], "who": who, "changes": changes or {}, "note": note, "note_mode": note_mode}
+    return {"action": "update", "date_from": None, "date_to": None, "groups": [], "terms": [], "who": who, "changes": changes or {}, "note": note, "note_mode": note_mode}
 
 
 async def press(ctx, uid, data):
@@ -429,6 +431,43 @@ class Bot_(unittest.TestCase):
         self.assertIn("הערה: רוצה לבוא באביב", last("document", ADMIN)[3])
         run(press(self.admin, ADMIN, f"send_{self.g().rows[0]['id']}"))
         self.assertIn("אנה", last("contact", ADMIN)[2])
+
+    def test_every_requirement_must_match(self):
+        mfa = {**ANNA, "first_name": "Pulotjon", "last_name": "Asraev", "company": "Ministry of Foreign Affairs of Uzbekistan",
+               "country": "Uzbekistan", "phone": "+998 90 937 55 11", "company_he": "משרד החוץ של אוזבקיסטן"}
+        swiss = {**ANNA, "first_name": "Shamshod", "last_name": "Yunusov", "company": "Embassy of Switzerland in Uzbekistan",
+                 "country": "Uzbekistan", "phone": "+998 90 000 00 01", "company_he": "שגרירות שווייץ"}
+        romania_mfa = {**ANNA, "first_name": "Ciprian", "last_name": "Mirica", "company": "Ministry of Foreign Affairs of Romania",
+                       "country": "Romania", "phone": "+40 700 000 001"}
+        for c in (mfa, swiss, romania_mfa):
+            self._save(self.admin, ADMIN, c)
+        handlers.parse_question = lambda q, d=None: search_filter(groups=[["Ministry of Foreign Affairs", "MFA", "משרד החוץ"], ["Uzbekistan", "Uzbek", "אוזבקיסטן"]])
+        run(text(self.admin, ADMIN, "את מי פגשתי במשרד החוץ האוזבקי?"))
+        result = last("edit", ADMIN)[2]
+        self.assertIn("Pulotjon", result)
+        self.assertNotIn("Shamshod", result, "Uzbekistan alone is not enough")
+        self.assertNotIn("Ciprian", result, "Foreign Affairs alone is not enough")
+        self.assertIn("· 1 אנשים", result)
+
+    def test_nothing_matches_everything_shows_closest_and_says_so(self):
+        self._save(self.admin, ADMIN, ANNA)
+        handlers.parse_question = lambda q, d=None: search_filter(groups=[["Siemens"], ["Brazil"]])
+        run(text(self.admin, ADMIN, "מי מסימנס בברזיל"))
+        result = last("edit", ADMIN)[2]
+        self.assertIn("לא מצאתי מי שמתאים לכל הפרטים", result)
+        self.assertIn("Anna", result)
+
+    def test_more_than_ten_shows_count_and_shares_all(self):
+        for i in range(12):
+            self._save(self.admin, ADMIN, {**ANNA, "first_name": f"P{i:02d}", "phone": f"+49 170 00000{i:02d}", "email": f"p{i}@x.de"})
+        handlers.parse_question = lambda q, d=None: search_filter(["Siemens"])
+        run(text(self.admin, ADMIN, "מי מסימנס"))
+        result = last("edit", ADMIN)
+        self.assertIn("10 מתוך 12 אנשים", result[2])
+        self.assertIn("📤 שתף את כל ה-12", [b.text for row in result[3].inline_keyboard for b in row])
+        run(press(self.admin, ADMIN, "share_all"))
+        run(press(self.admin, ADMIN, "share_plain"))
+        self.assertEqual(last("document", ADMIN)[3].count("BEGIN:VCARD"), 12)
 
     def test_users_see_only_their_own_cards(self):
         db.request_access(OTHER, "Other", None)
@@ -846,7 +885,7 @@ class QuestionParser(unittest.TestCase):
         extractor.gemini_client = SimpleNamespace(models=SimpleNamespace(generate_content=gen))
 
     def test_valid_search(self):
-        self._gemini('{"action": "search", "date_from": "2026-10-04", "date_to": "2026-10-10", "terms": ["Germany", "גרמניה"]}')
+        self._gemini('{"action": "search", "date_from": "2026-10-04", "date_to": "2026-10-10", "groups": [["Germany", "גרמניה"]]}')
         f = extractor.parse_question("את מי פגשנו שבוע שעבר בכנס הגרמני?", date(2026, 10, 14))
         self.assertEqual(f, search_filter(["Germany", "גרמניה"], "2026-10-04", "2026-10-10"))
 
@@ -858,6 +897,15 @@ class QuestionParser(unittest.TestCase):
     def test_update_without_who_or_change_becomes_a_search(self):
         self._gemini('{"action": "update", "who": [], "changes": {"address": "x"}, "terms": ["x"]}')
         self.assertEqual(extractor.parse_question("x")["action"], "search")
+
+    def test_groups_are_validated(self):
+        self._gemini('{"action": "search", "groups": [["MFA", "משרד החוץ", 7], [], "bad", ["Uzbekistan"]]}')
+        f = extractor.parse_question("את מי פגשתי במשרד החוץ האוזבקי?")
+        self.assertEqual(f["groups"], [["MFA", "משרד החוץ", "7"], ["Uzbekistan"]])
+
+    def test_old_style_terms_become_one_group(self):
+        self._gemini('{"action": "search", "terms": ["Germany", "גרמניה"]}')
+        self.assertEqual(extractor.parse_question("x")["groups"], [["Germany", "גרמניה"]])
 
     def test_bad_dates_dropped(self):
         self._gemini('{"date_from": "last week", "date_to": null, "terms": ["Germany"]}')

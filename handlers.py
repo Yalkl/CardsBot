@@ -21,6 +21,8 @@ from formatters import build_display_name, edit_menu, generate_vcard, render_pre
 
 HTML = "HTML"
 log = logging.getLogger("cardsbot")
+SHOW = 10  # people listed in an answer
+SHARE_MAX = 100  # "share all" covers every match, not only the ones listed
 BUSY = "⏳ Gemini עמוס כרגע (מגבלת שימוש לדקה). נסו שוב בעוד דקה."
 NOTE_MAX_LEN = 500
 
@@ -591,8 +593,9 @@ def describe_filter(f: dict) -> str:
         a, b = f.get("date_from"), f.get("date_to")
         fmt = lambda d: f"{d[8:10]}.{d[5:7]}" if d else "…"  # noqa: E731
         parts.append(fmt(a) if a == b else f"{fmt(a)}–{fmt(b)}")
-    if f.get("terms"):
-        parts.append(", ".join(f["terms"][:6]))
+    groups = f.get("groups") or ([f["terms"]] if f.get("terms") else [])
+    if groups:
+        parts.append(" + ".join(g[0] for g in groups))  # one word per requirement: "Ministry of Foreign Affairs + Uzbekistan"
     return " · ".join(parts)
 
 
@@ -679,9 +682,16 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
     if f.get("action") == "update":
         await propose_update(status, context, f, all_cards)
         return
-    rows = cards.search(all_cards, f["terms"], f["date_from"], f["date_to"])
-    context.user_data["last_results"] = [r["id"] for r in rows]
+    groups = f.get("groups") or ([f["terms"]] if f.get("terms") else [])
+    matches = cards.search(all_cards, f.get("terms", []), f["date_from"], f["date_to"], limit=None, groups=groups)
     desc = escape(describe_filter(f))
-    header = f"🔎 <i>{desc}</i> · {len(rows)} אנשים" if rows else f"🔎 <i>{desc}</i>"
-    text, markup = render_results(rows, header)
+    note = ""
+    if not matches and len(groups) > 1:
+        matches = cards.search_relaxed(all_cards, groups, f["date_from"], f["date_to"])
+        note = "\nלא מצאתי מי שמתאים לכל הפרטים. הכי קרובים:" if matches else ""
+    shown = matches[:SHOW]
+    context.user_data["last_results"] = [r["id"] for r in matches[:SHARE_MAX]]
+    count = f"{len(shown)} מתוך {len(matches)}" if len(matches) > len(shown) else f"{len(matches)}"
+    header = f"🔎 <i>{desc}</i> · {count} אנשים{note}" if matches else f"🔎 <i>{desc}</i>"
+    text, markup = render_results(shown, header, total=min(len(matches), SHARE_MAX))
     await status.edit_text(text, reply_markup=markup, parse_mode=HTML)

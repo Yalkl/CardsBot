@@ -154,7 +154,7 @@ def edit_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def render_results(rows: list[dict], header: str) -> tuple[str, InlineKeyboardMarkup | None]:
+def render_results(rows: list[dict], header: str, total: int | None = None) -> tuple[str, InlineKeyboardMarkup | None]:
     """Search results: one line per person with company, date, event and note; a button per person and "share all"."""
     if not rows:
         return f"{header}\n\nלא מצאתי אף אחד.", None
@@ -172,6 +172,7 @@ def render_results(rows: list[dict], header: str) -> tuple[str, InlineKeyboardMa
             lines.append(f"   📝 {escape(r['note'])}")
     buttons = [InlineKeyboardButton(f"📇 {i}", callback_data=f"send_{r['id']}") for i, r in enumerate(rows, 1)]
     keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
-    if len(rows) > 1:
-        keyboard.append([InlineKeyboardButton(f"📤 שתף את כל ה-{len(rows)}", callback_data="share_all")])
+    total = total or len(rows)
+    if total > 1:
+        keyboard.append([InlineKeyboardButton(f"📤 שתף את כל ה-{total}", callback_data="share_all")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)

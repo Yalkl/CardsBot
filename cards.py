@@ -268,9 +268,28 @@ def find_duplicate(cards: list[dict], data: dict) -> dict | None:
 SEARCH_FIELDS = CONTACT_FIELDS + ("event", "note", "display_name")
 
 
-def search(cards: list[dict], terms: list[str], date_from: str | None = None, date_to: str | None = None, limit: int = 10) -> list[dict]:
-    """Cards in the date range (inclusive) ranked by how many terms appear in any field; no terms = all in range."""
-    terms = [t.strip().lower() for t in terms if t and len(t.strip()) >= 2]
+def _hits(card: dict, terms: list[str]) -> int:
+    haystack = " | ".join(str(card.get(f) or "") for f in SEARCH_FIELDS).lower()
+    digits = re.sub(r"\D", "", f"{card.get('phone') or ''} {card.get('phone_office') or ''}")
+    n = 0
+    for t in terms:
+        t = t.strip().lower()
+        if len(t) < 2:
+            continue
+        t_digits = re.sub(r"\D", "", t)
+        if t in haystack or (len(t_digits) >= 4 and t_digits in digits):
+            n += 1
+    return n
+
+
+def search(cards: list[dict], terms: list[str], date_from: str | None = None, date_to: str | None = None,
+           limit: int | None = 10, groups: list[list[str]] | None = None) -> list[dict]:
+    """Cards in the date range (inclusive), best match first; no terms and no groups = everyone in the range.
+
+    groups: each inner list is one requirement with its synonyms; a card must match every group (AND of ORs).
+    terms (when no groups): a card must match at least one term.
+    """
+    groups = [g for g in (groups or []) if g] or ([terms] if terms else [])
     scored = []
     for card in cards:
         day = (card.get("scanned_at") or "")[:10]
@@ -278,13 +297,23 @@ def search(cards: list[dict], terms: list[str], date_from: str | None = None, da
             continue
         if date_to and day > date_to:
             continue
-        if not terms:
-            scored.append((0, card))
-            continue
-        haystack = " | ".join(str(card.get(f) or "") for f in SEARCH_FIELDS).lower()
-        digits = re.sub(r"\D", "", f"{card.get('phone') or ''} {card.get('phone_office') or ''}")
-        score = sum(1 for t in terms if t in haystack or (len(re.sub(r"\D", "", t)) >= 4 and re.sub(r"\D", "", t) in digits))
-        if score:
-            scored.append((score, card))
+        hits = [_hits(card, g) for g in groups]
+        if all(hits):
+            scored.append((sum(hits), card))
     scored.sort(key=lambda s: s[0], reverse=True)  # stable: newest first within a score
-    return [c for _, c in scored[:limit]]
+    out = [c for _, c in scored]
+    return out[:limit] if limit else out
+
+
+def search_relaxed(cards: list[dict], groups: list[list[str]], date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+    """The closest cards when nothing matches every group: ranked by how many groups they match."""
+    scored = []
+    for card in cards:
+        day = (card.get("scanned_at") or "")[:10]
+        if (date_from and day < date_from) or (date_to and day > date_to):
+            continue
+        matched = sum(1 for g in groups if _hits(card, g))
+        if matched:
+            scored.append((matched, _hits(card, [t for g in groups for t in g]), card))
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    return [c for *_, c in scored]

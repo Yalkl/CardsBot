@@ -131,7 +131,7 @@ def parse_question(question: str, today: date | None = None) -> dict:
     """Turns a free-text message into either a search or an update of a saved contact:
 
     {"action": "search" | "update",
-     "date_from": "YYYY-MM-DD" | None, "date_to": ... | None, "terms": [...],      # search filter
+     "date_from": "YYYY-MM-DD" | None, "date_to": ... | None, "groups": [[...], ...], "terms": [...],  # search filter
      "who": [...], "changes": {field: value}, "note": str | None, "note_mode": "append" | "replace"}  # update
 
     Gemini only produces this structure from the user's own words; it never sees the saved contacts, so a
@@ -153,16 +153,22 @@ def parse_question(question: str, today: date | None = None) -> dict:
 
     Return ONLY JSON:
     {{"action": "search" | "update",
-      "date_from": "YYYY-MM-DD" or null, "date_to": "YYYY-MM-DD" or null, "terms": [...],
+      "date_from": "YYYY-MM-DD" or null, "date_to": "YYYY-MM-DD" or null, "groups": [[...], ...],
       "who": [...], "changes": {{}}, "note": null, "note_mode": "append"}}
 
     For "search":
     - Dates only if the message mentions a time ("yesterday", "last week", "in September", "השבוע", "אתמול").
       "Last week" = the previous Sunday-to-Saturday week. Otherwise null.
-    - terms: at most 12 short keywords that would appear in the contact, both English and Hebrew forms
-      (nationality -> country: "גרמני" -> "Germany", "German", "גרמניה"), cities, industries, job titles ("מנכ״ל", "CEO"),
-      company or person names (also transliterated: "ניקיטה" -> "Nikita"), event words.
-      Skip filler words ("who", "met", "the", "guy", "את", "מי", "פגשנו", "של", "הבחור", "מה", "המספר") and time words.
+    - groups: one group per separate thing the person must match. A contact is shown only if it matches EVERY group.
+      Each group lists that one thing's short keywords as they could appear in the contact, in English and Hebrew
+      (and Latin transliteration of names), up to 8 per group, at most 4 groups. Examples:
+        "את מי פגשתי במשרד החוץ האוזבקי?" -> [["Ministry of Foreign Affairs", "MFA", "Foreign Affairs", "משרד החוץ"],
+                                              ["Uzbekistan", "Uzbek", "אוזבקיסטן", "אוזבקי"]]
+        "הבחור הרומני" -> [["Romania", "Romanian", "רומניה", "רומני"]]
+        "מנכ״לים מגרמניה" -> [["CEO", "Chief Executive", "מנכ״ל", "Managing Director"], ["Germany", "German", "גרמניה"]]
+        "ניקיטה" -> [["Nikita", "ניקיטה"]]
+      No group for generic words: person, guy, people, conference, meeting, event, company, number, "who", "met",
+      "את", "מי", "פגשנו", "פגשתי", "של", "הבחור", "מה", "המספר", "כנס", "אנשים"; and no group for time words (those are dates).
     For "update":
     - who: keywords that identify the person (name in Hebrew and Latin letters, company, event), at most 8.
     - changes: only fields the user gave a new value for, from: {", ".join(UPDATABLE)}.
@@ -175,7 +181,9 @@ def parse_question(question: str, today: date | None = None) -> dict:
 
     Message: {question[:500]!r}
     """
-    fallback = {"action": "search", "date_from": None, "date_to": None, "terms": _raw_words(question),
+    raw = _raw_words(question)
+    # Without Gemini the raw words are one group: any of them is enough (an AND of raw words would miss too much).
+    fallback = {"action": "search", "date_from": None, "date_to": None, "groups": [raw] if raw else [], "terms": raw,
                 "who": [], "changes": {}, "note": None, "note_mode": "append"}
     try:
         response = generate([prompt], types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0))
@@ -188,12 +196,19 @@ def parse_question(question: str, today: date | None = None) -> dict:
             note = str(out["note"]).strip()[:500] if isinstance(out.get("note"), str) and out["note"].strip() else None
             who = words("who", 8)
             if who and (changes or note):
-                return {"action": "update", "date_from": None, "date_to": None, "terms": [], "who": who, "changes": changes,
+                return {"action": "update", "date_from": None, "date_to": None, "groups": [], "terms": [], "who": who, "changes": changes,
                         "note": note, "note_mode": "replace" if out.get("note_mode") == "replace" else "append"}
-        terms = words("terms", 12)
-        if not terms and not d_from and not d_to:
+        groups = []
+        for g in (out.get("groups") or [])[:4]:
+            if isinstance(g, list):
+                g = [str(t)[:40] for t in g if isinstance(t, (str, int)) and str(t).strip()][:8]
+                if g:
+                    groups.append(g)
+        if not groups and out.get("terms"):  # an older-style answer: any of the words
+            groups = [words("terms", 12)]
+        if not groups and not d_from and not d_to:
             return fallback
-        return {**fallback, "date_from": d_from, "date_to": d_to, "terms": terms}
+        return {**fallback, "date_from": d_from, "date_to": d_to, "groups": groups, "terms": [t for g in groups for t in g]}
     except Exception:
         return fallback
 
