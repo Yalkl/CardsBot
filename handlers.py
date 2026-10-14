@@ -1,16 +1,19 @@
-"""Telegram handlers (docs/SPEC.md, phase A): approval, scan → preview → save with a note, event mode,
-open questions, and sharing a group of contacts as one file."""
+"""Telegram handlers (docs/SPEC.md): approval, Google connection, scan → preview → save with a note
+(to Google Contacts and the user's sheet), event mode, open questions, and sharing contacts as one file."""
 
 import asyncio
 import io
-from datetime import date
+from datetime import date, datetime
 from html import escape
 
+from google.auth.exceptions import RefreshError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+import cards
 import config
 import database as db
+import google_auth
 from extractor import extract_contact_info, parse_question
 from formatters import build_display_name, edit_menu, generate_vcard, render_preview, render_results
 
@@ -18,11 +21,12 @@ HTML = "HTML"
 NOTE_MAX_LEN = 500
 
 WELCOME = (
-    "👋 שלחו תמונה של כרטיס ביקור (צד אחד או שניים), והוא יישמר כאיש קשר עם הערה.\n\n"
-    "🏷️ <b>/event</b> שם האירוע: כל כרטיס שתסרקו עד סוף היום יסומן באירוע הזה. <b>/event off</b> מכבה.\n"
+    "👋 שלחו תמונה של כרטיס ביקור (צד אחד או שניים). הוא יישמר באנשי הקשר של גוגל ובטבלה בדרייב שלכם, עם הערה.\n\n"
+    "🏷️ <b>/event</b> שם האירוע: כל כרטיס שתסרקו עד סוף היום יסומן באירוע. <b>/event off</b> מכבה.\n"
     "🔎 אפשר פשוט לשאול: \"את מי פגשנו שבוע שעבר בכנס הגרמני?\"\n"
-    "🆔 <b>/myid</b>: המספר שלכם בטלגרם."
+    "📊 <b>/sheet</b>: קישור לטבלה. 🔌 <b>/connect</b> / <b>/disconnect</b>: חיבור לגוגל. 🆔 <b>/myid</b>"
 )
+NEED_CONNECT = "🔌 קודם מתחברים לגוגל: /connect"
 
 # user_data keys that belong to one card being saved; cleared after each save.
 SESSION_KEYS = ("pending_contact", "duplicate", "waiting_second_side", "editing_field", "waiting_for_note", "save_mode", "note_prompt")
@@ -77,9 +81,32 @@ async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 
+async def google_for(update_or_message, user_id: int):
+    """(sheet store, contacts client), or None after telling the user to connect."""
+    message = getattr(update_or_message, "effective_message", update_or_message)
+    try:
+        return cards.open_user(user_id)
+    except google_auth.GoogleNotConnected:
+        await message.reply_text(NEED_CONNECT)
+        return None
+
+
+async def google_failed(message, user_id: int, err: Exception):
+    """A Google call failed: a revoked or expired connection needs /connect; anything else, try again."""
+    if isinstance(err, (RefreshError, google_auth.GoogleNotConnected)):
+        db.clear_google(user_id)
+        await message.reply_text("🔌 החיבור לגוגל פג או בוטל. התחברו מחדש: /connect")
+    else:
+        await message.reply_text("⚠️ גוגל לא ענה כרגע. נסו שוב בעוד רגע.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await guard(update, context):
-        await update.message.reply_text(WELCOME, parse_mode=HTML)
+    if not await guard(update, context):
+        return
+    await update.message.reply_text(WELCOME, parse_mode=HTML)
+    u = db.get_user(update.effective_user.id) or {}
+    if not u.get("refresh_token_enc"):
+        await connect(update, context)
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -89,7 +116,47 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     status = "מנהל" if uid == config.ADMIN_TELEGRAM_ID else ("מאושר" if db.is_approved(uid) else "לא מאושר")
-    await update.message.reply_text(f"🆔 <code>{uid}</code>\nסטטוס: {status}", parse_mode=HTML)
+    email = (db.get_user(uid) or {}).get("google_email")
+    google = f"מחובר כ-{escape(email)}" if email else "לא מחובר"
+    await update.message.reply_text(f"🆔 <code>{uid}</code>\nסטטוס: {status}\nגוגל: {google}", parse_mode=HTML)
+
+
+# ---------------------------------------------------------------- Google connection
+
+async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    if not config.google_configured():
+        await update.message.reply_text("החיבור לגוגל עוד לא הוגדר בשרת.")
+        return
+    url = google_auth.new_login_url(update.effective_user.id)
+    await update.message.reply_text(
+        "🔌 חיבור לגוגל: הכרטיסים יישמרו באנשי הקשר שלכם ובטבלה בדרייב.\n"
+        "הבוט מקבל גישה רק לאנשי הקשר ולקבצים שהוא עצמו יוצר, לא לשאר הדרייב.\n"
+        "הקישור תקף ל-10 דקות. אם גוגל מזהירה ש\"האפליקציה לא מאומתת\": Advanced ← Go to CardsBot.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 התחברות עם גוגל", url=url)]]),
+    )
+
+
+async def disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    await google_auth.revoke(update.effective_user.id)
+    await update.message.reply_text("🔌 נותק מגוגל. אנשי הקשר והטבלה נשארים אצלכם בגוגל.")
+
+
+async def sheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    g = await google_for(update, update.effective_user.id)
+    if not g:
+        return
+    try:
+        url = await asyncio.to_thread(g[0].url)
+    except Exception as e:
+        await google_failed(update.message, update.effective_user.id, e)
+        return
+    await update.message.reply_text(f"📊 הטבלה שלכם: {url}")
 
 
 # ---------------------------------------------------------------- event mode
@@ -121,11 +188,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     message = update.message
+    g = await google_for(update, user.id)
+    if not g:
+        return
+    store, contacts = g
 
     # Next card arrived while the previous one waits for a note: save the previous one without a note.
     if context.user_data.get("waiting_for_note") and context.user_data.get("pending_contact"):
         await close_note_prompt(context)
-        await message.reply_text(await finalize_save(context, message.chat_id, user, None) + "\n(נשמר בלי הערה)", parse_mode=HTML)
+        text, markup = await finalize_save(context, message, user, None)
+        await message.reply_text(text + "\n(נשמר בלי הערה)", reply_markup=markup, parse_mode=HTML)
 
     second_side = context.user_data.get("waiting_second_side") and context.user_data.get("pending_contact")
     status = await message.reply_text("🔍 קורא את הצד השני…" if second_side else "🔍 קורא את הכרטיס…")
@@ -140,7 +212,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = merge_card_data(context.user_data["pending_contact"], new_data) if second_side else new_data
     clear_session(context)
     context.user_data["pending_contact"] = data
-    context.user_data["duplicate"] = db.find_duplicate(user.id, data)
+    try:
+        existing = await asyncio.to_thread(store.all)
+    except Exception:
+        existing = []  # the duplicate check is a help, not a must
+    context.user_data["duplicate"] = cards.find_duplicate(existing, data)
     text, markup = render_preview(data, context.user_data["duplicate"], db.get_event(user.id))
     await status.delete()
     await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
@@ -170,34 +246,70 @@ async def close_note_prompt(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def send_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, data: dict, event=None, note=None, scanned_at=None):
+async def send_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, card: dict):
     """A contact the phone can save in one tap; a .vcf file when there is no phone number."""
-    vcard = generate_vcard(data, event=event, note=note, scanned_at=scanned_at)
-    phone = db.clean_phone_number(data.get("phone", ""))
+    vcard = generate_vcard(card)
+    phone = db.clean_phone_number(card.get("phone", ""))
     if phone:
-        await context.bot.send_contact(chat_id=chat_id, phone_number=phone, first_name=build_display_name(data), last_name="", vcard=vcard)
+        await context.bot.send_contact(chat_id=chat_id, phone_number=phone, first_name=build_display_name(card), last_name="", vcard=vcard)
     else:
         doc = io.BytesIO(vcard.encode("utf-8"))
         doc.name = "contact.vcf"
         await context.bot.send_document(chat_id=chat_id, document=doc)
 
 
-async def finalize_save(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, note: str | None) -> str:
-    """Stores the card (new or update), sends the contact, clears the session. Returns the confirmation text."""
+def _save_to_google(store, contacts, card: dict, existing: dict | None) -> tuple[str, bool]:
+    """Writes the card to the sheet and to Google Contacts. Returns (card id, contacts ok).
+
+    The sheet is the record: if it fails, this raises and nothing counts as saved. Contacts is retried later.
+    """
+    if existing:
+        merged = {**existing, **{k: v for k, v in card.items() if v}}
+        merged["note"] = " | ".join(n for n in (existing.get("note"), card.get("note")) if n)
+        card = merged
+    contact_ok = True
+    try:
+        resource = existing.get("google_contact") if existing else ""
+        card["google_contact"] = contacts.update(resource, card) if resource else contacts.create(card)
+    except Exception:
+        contact_ok = False
+        card["google_contact"] = card.get("google_contact") or ""
+    if existing:
+        store.update(existing["id"], card)
+        return existing["id"], contact_ok
+    return store.insert(card), contact_ok
+
+
+async def finalize_save(context: ContextTypes.DEFAULT_TYPE, message, user, note: str | None):
+    """Saves the pending card in Google. Returns (text, keyboard) for the confirmation.
+
+    On failure the card stays pending, so the user can press save again.
+    """
     data = context.user_data["pending_contact"]
-    event = db.get_event(user.id)
     dup = context.user_data.get("duplicate")
-    if context.user_data.get("save_mode") == "update" and dup:
-        db.update_card(user.id, dup["id"], data, event, note)
-        verb = "עודכן"
-    else:
-        db.insert_card(user.id, data, event, note)
-        verb = "נשמר"
+    card = {**data, "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M"), "event": db.get_event(user.id) or "", "note": note or ""}
+    existing = dup["row"] if (context.user_data.get("save_mode") == "update" and dup) else None
+    try:
+        store, contacts = cards.open_user(user.id)
+        card_id, contact_ok = await asyncio.to_thread(_save_to_google, store, contacts, card, existing)
+    except Exception as e:
+        context.user_data["waiting_for_note"] = False
+        if isinstance(e, (RefreshError, google_auth.GoogleNotConnected)):
+            db.clear_google(user.id)
+            return "🔌 החיבור לגוגל פג. התחברו מחדש (/connect) ואז לחצו שמור שוב.", _back_keyboard()
+        return "⚠️ השמירה לגוגל נכשלה. הכרטיס עדיין כאן, נסו שוב.", _back_keyboard()
+
     if note:
         db.set_last_note(user.id, note)
-    await send_card(context, chat_id, data, event, note)
     clear_session(context)
-    return f"✅ {verb}: <b>{escape(build_display_name(data))}</b>\nלחצו על איש הקשר למעלה כדי לשמור אותו בטלפון."
+    verb = "עודכן" if existing else "נשמר"
+    status = "אנשי קשר ✓ · טבלה ✓" if contact_ok else "טבלה ✓ · אנשי קשר ✗"
+    markup = None if contact_ok else InlineKeyboardMarkup([[InlineKeyboardButton("🔁 נסה שוב לשמור באנשי קשר", callback_data=f"retry_{card_id}")]])
+    return f"✅ {verb}: <b>{escape(build_display_name(card))}</b>\n{status}", markup
+
+
+def _back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לכרטיס", callback_data="back_to_preview")]])
 
 
 EDIT_PROMPTS = {
@@ -243,7 +355,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.decide_access(target, approve)
         await query.edit_message_text(f"{'✅ אושר' if approve else '🚫 נדחה'}: {target}")
         try:
-            await context.bot.send_message(chat_id=target, text=("✅ הגישה אושרה.\n\n" + WELCOME) if approve else "🚫 בקשת הגישה נדחתה.", parse_mode=HTML)
+            await context.bot.send_message(
+                chat_id=target, text=("✅ הגישה אושרה. שלחו /start כדי להתחיל.") if approve else "🚫 בקשת הגישה נדחתה."
+            )
         except Exception:
             pass
         return
@@ -251,11 +365,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not db.is_approved(user.id):
         return
 
-    # Results of a question: send one contact, or share them all.
-    if action.startswith("send_"):
-        card = db.get_card(user.id, int(action.split("_", 1)[1]))
-        if card:
-            await send_card(context, query.message.chat_id, card, card.get("event"), card.get("note"), card.get("scanned_at"))
+    # Things that read the user's saved cards.
+    if action.startswith(("send_", "retry_")) or action in ("share_plain", "share_notes"):
+        g = await google_for(query.message, user.id)
+        if not g:
+            return
+        store, contacts = g
+        try:
+            all_cards = await asyncio.to_thread(store.all)
+        except Exception as e:
+            await google_failed(query.message, user.id, e)
+            return
+        by_id = {c["id"]: c for c in all_cards}
+        if action.startswith("send_"):
+            card = by_id.get(action.split("_", 1)[1])
+            if card:
+                await send_card(context, query.message.chat_id, card)
+        elif action.startswith("retry_"):
+            card = by_id.get(action.split("_", 1)[1])
+            if not card:
+                await query.edit_message_text("⚠️ הכרטיס לא נמצא בטבלה.")
+                return
+            try:
+                await asyncio.to_thread(_retry_contact, store, contacts, card)
+                await query.edit_message_text(f"✅ נשמר באנשי קשר: <b>{escape(build_display_name(card))}</b>", parse_mode=HTML)
+            except Exception:
+                await query.message.reply_text("⚠️ עדיין לא הצליח. נסו שוב מאוחר יותר.")
+        else:
+            chosen = [by_id[i] for i in context.user_data.get("last_results", []) if i in by_id]
+            if not chosen:
+                await query.edit_message_text("⚠️ אין רשימה לשתף. שאלו שוב.")
+                return
+            with_notes = action == "share_notes"
+            vcf = "\r\n".join(generate_vcard(c, include_note=with_notes) for c in chosen)
+            events = {c.get("event") for c in chosen if c.get("event")}
+            title = events.pop() if len(events) == 1 else "כרטיסי ביקור"
+            doc = io.BytesIO(vcf.encode("utf-8"))
+            doc.name = f"{title} – {len(chosen)} אנשי קשר.vcf"
+            summary = "\n".join(f"• {escape(build_display_name(c))}" for c in chosen)
+            await query.edit_message_text(f"📤 {len(chosen)} אנשי קשר{' עם הערות' if with_notes else ''}. אפשר להעביר את הקובץ בוואטסאפ או בטלגרם:")
+            await context.bot.send_document(chat_id=query.message.chat_id, document=doc, caption=summary[:1000], parse_mode=HTML)
         return
     if action == "share_all":
         await query.message.reply_text(
@@ -265,21 +414,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("עם הערות", callback_data="share_notes"),
             ]]),
         )
-        return
-    if action in ("share_plain", "share_notes"):
-        cards = [c for c in (db.get_card(user.id, i) for i in context.user_data.get("last_results", [])) if c]
-        if not cards:
-            await query.edit_message_text("⚠️ אין רשימה לשתף. שאלו שוב.")
-            return
-        with_notes = action == "share_notes"
-        vcf = "\r\n".join(generate_vcard(c, c.get("event"), c.get("note"), c.get("scanned_at"), include_note=with_notes) for c in cards)
-        events = {c.get("event") for c in cards if c.get("event")}
-        title = (events.pop() if len(events) == 1 else "כרטיסי ביקור")
-        doc = io.BytesIO(vcf.encode("utf-8"))
-        doc.name = f"{title} – {len(cards)} אנשי קשר.vcf"
-        summary = "\n".join(f"• {escape(build_display_name(c))}" for c in cards)
-        await query.edit_message_text(f"📤 {len(cards)} אנשי קשר{' עם הערות' if with_notes else ''}. אפשר להעביר את הקובץ בוואטסאפ או בטלגרם:")
-        await context.bot.send_document(chat_id=query.message.chat_id, document=doc, caption=summary[:1000], parse_mode=HTML)
         return
 
     # Everything below belongs to the card being saved.
@@ -296,13 +430,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.user_data.get("waiting_for_note"):
             return
         note = db.get_last_note(user.id) if action == "note_repeat" else None
-        await query.edit_message_text(await finalize_save(context, query.message.chat_id, user, note), parse_mode=HTML)
+        text, markup = await finalize_save(context, query.message, user, note)
+        await query.edit_message_text(text, reply_markup=markup, parse_mode=HTML)
     elif action == "scan_second_side":
         context.user_data["waiting_second_side"] = True
-        await query.edit_message_text(
-            "📷 שלחו תמונה של הצד השני. הפרטים יתמזגו.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_to_preview")]]),
-        )
+        await query.edit_message_text("📷 שלחו תמונה של הצד השני. הפרטים יתמזגו.", reply_markup=_back_keyboard())
     elif action == "open_edit_menu":
         context.user_data["editing_field"] = None
         await query.edit_message_text("✏️ מה לתקן?", reply_markup=edit_menu())
@@ -323,6 +455,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🚫 בוטל.")
 
 
+def _retry_contact(store, contacts, card: dict):
+    card = {**card, "google_contact": contacts.create(card)}
+    store.update(card["id"], card)
+
+
 # ---------------------------------------------------------------- text: edits, notes, questions
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -334,14 +471,15 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data and context.user_data.get("editing_field"):
         apply_edit(data, context.user_data.pop("editing_field"), text)
-        context.user_data["duplicate"] = db.find_duplicate(user.id, data)
-        preview, markup = render_preview(data, context.user_data["duplicate"], db.get_event(user.id))
+        dup = context.user_data.get("duplicate")
+        preview, markup = render_preview(data, dup, db.get_event(user.id))
         await update.message.reply_text("✅ עודכן\n\n" + preview, reply_markup=markup, parse_mode=HTML)
         return
 
     if data and context.user_data.get("waiting_for_note"):
         await close_note_prompt(context)
-        await update.message.reply_text(await finalize_save(context, update.message.chat_id, user, text[:NOTE_MAX_LEN]), parse_mode=HTML)
+        reply, markup = await finalize_save(context, update.message, user, text[:NOTE_MAX_LEN])
+        await update.message.reply_text(reply, reply_markup=markup, parse_mode=HTML)
         return
 
     await answer_question(update, context, text)
@@ -361,8 +499,8 @@ def describe_filter(f: dict) -> str:
     parts = []
     if f.get("date_from") or f.get("date_to"):
         a, b = f.get("date_from"), f.get("date_to")
-        fmt = lambda d: f"{d[8:10]}.{d[5:7]}"  # noqa: E731
-        parts.append(fmt(a) if a == b else f"{fmt(a) if a else '…'}–{fmt(b) if b else '…'}")
+        fmt = lambda d: f"{d[8:10]}.{d[5:7]}" if d else "…"  # noqa: E731
+        parts.append(fmt(a) if a == b else f"{fmt(a)}–{fmt(b)}")
     if f.get("terms"):
         parts.append(", ".join(f["terms"][:6]))
     return " · ".join(parts)
@@ -370,10 +508,22 @@ def describe_filter(f: dict) -> str:
 
 async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
     user = update.effective_user
+    g = await google_for(update, user.id)
+    if not g:
+        return
     status = await update.message.reply_text("🔎 מחפש…")
-    f = await asyncio.to_thread(parse_question, question, date.today())
-    rows = db.search_cards(user.id, f["terms"], f["date_from"], f["date_to"])
+    try:
+        f, all_cards = await asyncio.gather(
+            asyncio.to_thread(parse_question, question, date.today()),
+            asyncio.to_thread(g[0].all),
+        )
+    except Exception as e:
+        await status.delete()
+        await google_failed(update.message, user.id, e)
+        return
+    rows = cards.search(all_cards, f["terms"], f["date_from"], f["date_to"])
     context.user_data["last_results"] = [r["id"] for r in rows]
-    header = f"🔎 <i>{escape(describe_filter(f))}</i> · {len(rows)} אנשים" if rows else f"🔎 <i>{escape(describe_filter(f))}</i>"
+    desc = escape(describe_filter(f))
+    header = f"🔎 <i>{desc}</i> · {len(rows)} אנשים" if rows else f"🔎 <i>{desc}</i>"
     text, markup = render_results(rows, header)
     await status.edit_text(text, reply_markup=markup, parse_mode=HTML)

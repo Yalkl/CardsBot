@@ -41,26 +41,31 @@ def _vc(text: str) -> str:
     return text.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\r\n", "\\n").replace("\n", "\\n")
 
 
-def generate_vcard(data: dict, event: str | None = None, note: str | None = None, scanned_at: str | None = None, include_note: bool = True) -> str:
-    """vCard 3.0: the display name on top, the real fields below (company and title as on the card)."""
-    display = build_display_name(data)
-    phone = clean_phone_number(data.get("phone", ""))
-    digits = re.sub(r"\D", "", phone)
-    tg = _s(data, "telegram").lstrip("@")
-    website = _s(data, "website")
-    if website and not website.startswith("http"):
-        website = f"https://{website}"
-
-    when = scanned_at[:10] if scanned_at else datetime.now().strftime("%Y-%m-%d")
+def contact_notes(card: dict, include_note: bool = True) -> str:
+    """The notes text of a contact: scan date, event, the user's note, WhatsApp and Telegram links."""
+    digits = re.sub(r"\D", "", clean_phone_number(card.get("phone", "")))
+    tg = _s(card, "telegram").lstrip("@")
+    when = (card.get("scanned_at") or datetime.now().strftime("%Y-%m-%d"))[:10]
     notes = [f"נסרק {when}"]
-    if event:
-        notes.append(f"אירוע: {event}")
-    if note and include_note:
-        notes.append(f"הערה: {note}")
+    if _s(card, "event"):
+        notes.append(f"אירוע: {_s(card, 'event')}")
+    if _s(card, "note") and include_note:
+        notes.append(f"הערה: {_s(card, 'note')}")
     if digits:
         notes.append(f"WhatsApp: https://wa.me/{digits}")
     if tg:
         notes.append(f"Telegram: https://t.me/{tg}")
+    return "\n".join(notes)
+
+
+def generate_vcard(card: dict, include_note: bool = True) -> str:
+    """vCard 3.0: the display name on top, the real fields below (company and title as on the card)."""
+    data = card
+    display = build_display_name(data)
+    phone = clean_phone_number(data.get("phone", ""))
+    website = _s(data, "website")
+    if website and not website.startswith("http"):
+        website = f"https://{website}"
 
     lines = ["BEGIN:VCARD", "VERSION:3.0", f"N:;{_vc(display)};;;", f"FN:{_vc(display)}"]
     if english_name(data):
@@ -78,7 +83,7 @@ def generate_vcard(data: dict, event: str | None = None, note: str | None = None
     addr = ", ".join(x for x in (_s(data, "address"), _s(data, "country")) if x)
     if addr:
         lines.append(f"ADR;TYPE=WORK:;;{_vc(addr)};;;;")
-    lines.append(f"NOTE:{_vc(chr(10).join(notes))}")
+    lines.append(f"NOTE:{_vc(contact_notes(card, include_note))}")
     lines.append("END:VCARD")
     return "\r\n".join(lines)
 

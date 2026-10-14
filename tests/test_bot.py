@@ -1,6 +1,7 @@
-"""Phase A tests (docs/SPEC.md): fake Telegram objects, fake Gemini, a temporary SQLite database.
+"""Tests (docs/SPEC.md): fake Telegram, fake Gemini, fake Google; a temporary accounts database.
 
 Run:  python -m unittest discover -s tests -v
+SQLite by default; TEST_DATABASE_URL runs the same tests on PostgreSQL (a throwaway local database).
 """
 
 import asyncio
@@ -10,20 +11,29 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
+from unittest import mock
 
 ADMIN, OTHER, STRANGER = 111, 222, 333
 _tmp = tempfile.mkdtemp()
-os.environ.update(TELEGRAM_BOT_TOKEN="test", GEMINI_API_KEY="test", ADMIN_TELEGRAM_ID=str(ADMIN), LOCAL_SQLITE_PATH=os.path.join(_tmp, "t.db"))
-# SQLite by default; TEST_DATABASE_URL runs the same tests on PostgreSQL (a throwaway local database).
+os.environ.update(
+    TELEGRAM_BOT_TOKEN="test", GEMINI_API_KEY="test", ADMIN_TELEGRAM_ID=str(ADMIN), LOCAL_SQLITE_PATH=os.path.join(_tmp, "t.db"),
+    GOOGLE_CLIENT_ID="cid", GOOGLE_CLIENT_SECRET="csecret", PUBLIC_URL="https://bot.example",
+    TOKEN_ENC_KEY="x4Q1aJ0r4nRk3G7mY2b9sVfL8cT5uWzE1hN6pD3qK0o=",
+)
 if os.environ.get("TEST_DATABASE_URL"):
     os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 else:
     os.environ.pop("DATABASE_URL", None)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from google.auth.exceptions import RefreshError  # noqa: E402
+
+import cards  # noqa: E402
 import database as db  # noqa: E402
 import extractor  # noqa: E402
+import google_auth  # noqa: E402
 import handlers  # noqa: E402
+import web  # noqa: E402
 
 NIKITA = {
     "first_name": "Nikita", "last_name": "Ivanov", "company": "Embassy of Bulgaria", "job_title": "Deputy Ambassador",
@@ -37,12 +47,84 @@ log: list = []
 next_card: list = []
 
 
-def fake_extract(_bytes):
-    return dict(next_card.pop(0))
+# ---------------------------------------------------------------- fake Google (for handler tests)
+
+class FakeGoogle:
+    """One user's Google: the sheet rows and the contacts, in memory."""
+
+    def __init__(self):
+        self.rows: list[dict] = []
+        self.contacts: dict[str, dict] = {}
+        self.fail_contacts = False
+        self.fail_sheet = False
+        self.refresh_error = False
+        self.n = 0
+
+    # SheetStore interface
+    def all(self):
+        if self.refresh_error:
+            raise RefreshError("revoked")
+        return sorted((dict(r) for r in self.rows), key=lambda c: c.get("scanned_at") or "", reverse=True)
+
+    def insert(self, card):
+        if self.fail_sheet:
+            raise RuntimeError("sheets down")
+        self.n += 1
+        row = {**card, "id": f"c{self.n}"}
+        self.rows.append(row)
+        return row["id"]
+
+    def update(self, card_id, card):
+        for i, r in enumerate(self.rows):
+            if r["id"] == card_id:
+                self.rows[i] = {**card, "id": card_id}
+                return True
+        return False
+
+    def url(self):
+        return "https://docs.google.com/spreadsheets/d/fake"
+
+    # ContactsClient interface
+    def create(self, card):
+        if self.fail_contacts:
+            raise RuntimeError("people down")
+        rid = f"people/{len(self.contacts) + 1}"
+        self.contacts[rid] = dict(card)
+        return rid
 
 
-handlers.extract_contact_info = fake_extract
+class FakeContacts:
+    def __init__(self, g):
+        self.g = g
 
+    def create(self, card):
+        return self.g.create(card)
+
+    def update(self, resource, card):
+        self.g.contacts[resource] = dict(card)
+        return resource
+
+
+google: dict[int, FakeGoogle] = {}
+
+
+def fake_open_user(uid):
+    u = db.get_user(uid)
+    if not u or not u.get("refresh_token_enc"):
+        raise google_auth.GoogleNotConnected()
+    g = google.setdefault(uid, FakeGoogle())
+    return g, FakeContacts(g)
+
+
+def connect(uid):
+    db.save_google(uid, f"u{uid}@gmail.com", google_auth.encrypt("refresh-token"))
+
+
+handlers.extract_contact_info = lambda _b: dict(next_card.pop(0))
+handlers.cards.open_user = fake_open_user
+
+
+# ---------------------------------------------------------------- fake Telegram
 
 class Msg:
     _id = 0
@@ -84,8 +166,6 @@ class Bot:
 
 
 class Ctx:
-    """One context per user, like python-telegram-bot's user_data."""
-
     def __init__(self):
         self.user_data, self.bot, self.args = {}, Bot(), []
 
@@ -127,7 +207,7 @@ async def command(fn, ctx, uid, *args):
 
 
 def buttons(markup):
-    return [b.callback_data for row in markup.inline_keyboard for b in row] if markup else []
+    return [getattr(b, "callback_data", None) or getattr(b, "url", None) for row in markup.inline_keyboard for b in row] if markup else []
 
 
 def last(kind, chat=None):
@@ -138,7 +218,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
-class PhaseA(unittest.TestCase):
+def reset_db():
+    for t in ("users", "active_events", "oauth_states"):
+        db._run(f"DELETE FROM {t}")
+
+
+class Bot_(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         db.init_db()
@@ -146,130 +231,13 @@ class PhaseA(unittest.TestCase):
     def setUp(self):
         log.clear()
         next_card.clear()
-        for t in ("cards", "users", "active_events"):
-            db._run(f"DELETE FROM {t}")
+        google.clear()
+        reset_db()
+        connect(ADMIN)
         self.admin, self.other, self.stranger = Ctx(), Ctx(), Ctx()
 
-    # ---- access
-
-    def test_stranger_is_blocked_and_admin_asked_once(self):
-        run(command(handlers.start, self.stranger, STRANGER))
-        self.assertIn("בקשת הגישה נשלחה", last("reply", STRANGER)[2])
-        ask = last("message", ADMIN)
-        self.assertIn(f"approve_{STRANGER}", buttons(ask[3]))
-        run(photo(self.stranger, STRANGER, NIKITA))
-        self.assertEqual(len([e for e in log if e[0] == "message" and e[1] == ADMIN]), 1, "admin asked only once")
-        self.assertEqual(next_card, [NIKITA], "card was not read for a stranger")
-
-    def test_admin_approves_then_user_can_scan(self):
-        run(command(handlers.start, self.stranger, STRANGER))
-        run(press(self.admin, ADMIN, f"approve_{STRANGER}"))
-        self.assertIn("הגישה אושרה", last("message", STRANGER)[2])
-        run(photo(self.stranger, STRANGER, NIKITA))
-        self.assertIn("save_default", buttons(last("reply", STRANGER)[3]))
-
-    def test_denied_user_stays_out_and_only_admin_can_decide(self):
-        run(command(handlers.start, self.stranger, STRANGER))
-        run(press(self.other, OTHER, f"approve_{STRANGER}"))  # not the admin
-        self.assertFalse(db.is_approved(STRANGER))
-        run(press(self.admin, ADMIN, f"deny_{STRANGER}"))
-        run(command(handlers.start, self.stranger, STRANGER))
-        self.assertIn("אין לך גישה", last("reply", STRANGER)[2])
-
-    # ---- scan and save
-
-    def test_scan_save_with_note_hebrew_display_name(self):
-        run(photo(self.admin, ADMIN, NIKITA))
-        preview = last("reply", ADMIN)
-        self.assertIn("ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov", preview[2])
-        run(press(self.admin, ADMIN, "save_default"))
-        self.assertIn("הערה?", last("edit", ADMIN)[2])
-        run(text(self.admin, ADMIN, "רוצה לבוא לביקור באביב"))
-        contact = last("contact", ADMIN)
-        self.assertEqual(contact[2], "ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov")
-        self.assertIn("ORG:Embassy of Bulgaria", contact[3])
-        self.assertIn("הערה: רוצה לבוא לביקור באביב", contact[3])
-        cards = db.all_cards(ADMIN)
-        self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0]["note"], "רוצה לבוא לביקור באביב")
-        self.assertEqual(cards[0]["phone"], "+359881234567")
-        self.assertEqual(db.get_last_note(ADMIN), "רוצה לבוא לביקור באביב")
-        self.assertNotIn("pending_contact", self.admin.user_data)
-
-    def test_brand_company_stays_in_original(self):
-        run(photo(self.admin, ADMIN, ANNA))
-        self.assertIn("אנה מולר · מנהלת מכירות · Siemens · Anna Muller", last("reply", ADMIN)[2])
-
-    def test_note_repeat_and_skip(self):
-        db.set_last_note(ADMIN, "כנס היין")
-        run(photo(self.admin, ADMIN, NIKITA))
-        run(press(self.admin, ADMIN, "save_default"))
-        self.assertIn("note_repeat", buttons(last("edit", ADMIN)[3]))
-        run(press(self.admin, ADMIN, "note_repeat"))
-        run(photo(self.admin, ADMIN, ANNA))
-        run(press(self.admin, ADMIN, "save_default"))
-        run(press(self.admin, ADMIN, "note_skip"))
-        notes = sorted((c["note"] or "") for c in db.all_cards(ADMIN))
-        self.assertEqual(notes, ["", "כנס היין"])
-
-    def test_next_photo_saves_previous_without_note(self):
-        run(photo(self.admin, ADMIN, NIKITA))
-        run(press(self.admin, ADMIN, "save_default"))
-        run(photo(self.admin, ADMIN, ANNA))
-        self.assertEqual(len(db.all_cards(ADMIN)), 1)
-        self.assertTrue(any("נשמר בלי הערה" in e[2] for e in log if e[0] == "reply"))
-        self.assertEqual(self.admin.user_data["pending_contact"]["first_name"], "Anna")
-
-    def test_event_mode_tags_scans_until_off(self):
-        run(command(handlers.event_cmd, self.admin, ADMIN, "כנס", "גרמניה", "2026"))
-        run(photo(self.admin, ADMIN, ANNA))
-        self.assertIn("אירוע: כנס גרמניה 2026", last("reply", ADMIN)[2])
-        run(press(self.admin, ADMIN, "save_default"))
-        run(press(self.admin, ADMIN, "note_skip"))
-        run(command(handlers.event_cmd, self.admin, ADMIN, "off"))
-        run(photo(self.admin, ADMIN, NIKITA))
-        run(press(self.admin, ADMIN, "save_default"))
-        run(press(self.admin, ADMIN, "note_skip"))
-        events = {c["first_name"]: c["event"] for c in db.all_cards(ADMIN)}
-        self.assertEqual(events, {"Anna": "כנס גרמניה 2026", "Nikita": ""})
-
-    def test_event_expires(self):
-        db.set_event(ADMIN, "ישן")
-        db._run("UPDATE active_events SET expires_at = ? WHERE owner_id = ?", ((datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M"), ADMIN))
-        self.assertIsNone(db.get_event(ADMIN))
-
-    def test_duplicate_offers_update_and_update_keeps_one_card(self):
-        run(photo(self.admin, ADMIN, NIKITA))
-        run(press(self.admin, ADMIN, "save_default"))
-        run(text(self.admin, ADMIN, "פגישה ראשונה"))
-        run(photo(self.admin, ADMIN, {**NIKITA, "email": "new@mfa.bg"}))
-        preview = last("reply", ADMIN)
-        self.assertIn("כבר שמור", preview[2])
-        self.assertIn("save_update", buttons(preview[3]))
-        run(press(self.admin, ADMIN, "save_update"))
-        run(text(self.admin, ADMIN, "פגישה שנייה"))
-        cards = db.all_cards(ADMIN)
-        self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0]["email"], "new@mfa.bg")
-        self.assertEqual(cards[0]["note"], "פגישה ראשונה | פגישה שנייה")
-
-    def test_edit_hebrew_name(self):
-        run(photo(self.admin, ADMIN, NIKITA))
-        run(press(self.admin, ADMIN, "edit_field_name_he"))
-        run(text(self.admin, ADMIN, "ניקיטה איוואנוב"))
-        self.assertIn("ניקיטה איוואנוב · סגן שגריר", last("reply", ADMIN)[2])
-
-    def test_card_without_phone_is_sent_as_file(self):
-        run(photo(self.admin, ADMIN, {**ANNA, "phone": ""}))
-        run(press(self.admin, ADMIN, "save_default"))
-        run(press(self.admin, ADMIN, "note_skip"))
-        self.assertEqual(last("document", ADMIN)[2], "contact.vcf")
-
-    def test_user_text_is_escaped(self):
-        run(photo(self.admin, ADMIN, {**NIKITA, "first_name_he": "<b>x</b>"}))
-        self.assertIn("&lt;b&gt;x&lt;/b&gt;", last("reply", ADMIN)[2])
-
-    # ---- questions and sharing
+    def g(self, uid=ADMIN) -> FakeGoogle:
+        return google.setdefault(uid, FakeGoogle())
 
     def _save(self, ctx, uid, card, note=None):
         run(photo(ctx, uid, card))
@@ -279,12 +247,144 @@ class PhaseA(unittest.TestCase):
         else:
             run(press(ctx, uid, "note_skip"))
 
+    # ---- access
+
+    def test_stranger_is_blocked_and_admin_asked_once(self):
+        run(command(handlers.start, self.stranger, STRANGER))
+        self.assertIn("בקשת הגישה נשלחה", last("reply", STRANGER)[2])
+        self.assertIn(f"approve_{STRANGER}", buttons(last("message", ADMIN)[3]))
+        run(photo(self.stranger, STRANGER, NIKITA))
+        self.assertEqual(len([e for e in log if e[0] == "message" and e[1] == ADMIN]), 1)
+        self.assertEqual(next_card, [NIKITA], "card was not read for a stranger")
+
+    def test_approved_user_must_connect_google_before_scanning(self):
+        run(command(handlers.start, self.stranger, STRANGER))
+        run(press(self.admin, ADMIN, f"approve_{STRANGER}"))
+        self.assertIn("הגישה אושרה", last("message", STRANGER)[2])
+        run(command(handlers.start, self.stranger, STRANGER))
+        login = last("reply", STRANGER)
+        self.assertTrue(buttons(login[3])[0].startswith("https://accounts.google.com/"), "start offers the Google sign-in")
+        run(photo(self.stranger, STRANGER, NIKITA))
+        self.assertEqual(last("reply", STRANGER)[2], handlers.NEED_CONNECT)
+        connect(STRANGER)
+        run(photo(self.stranger, STRANGER, NIKITA))
+        self.assertIn("save_default", buttons(last("reply", STRANGER)[3]))
+
+    def test_only_admin_decides(self):
+        run(command(handlers.start, self.stranger, STRANGER))
+        run(press(self.other, OTHER, f"approve_{STRANGER}"))
+        self.assertFalse(db.is_approved(STRANGER))
+        run(press(self.admin, ADMIN, f"deny_{STRANGER}"))
+        run(command(handlers.start, self.stranger, STRANGER))
+        self.assertIn("אין לך גישה", last("reply", STRANGER)[2])
+
+    # ---- scan and save to Google
+
+    def test_scan_save_with_note_goes_to_sheet_and_contacts(self):
+        run(command(handlers.event_cmd, self.admin, ADMIN, "כנס", "גרמניה"))
+        run(photo(self.admin, ADMIN, NIKITA))
+        self.assertIn("ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov", last("reply", ADMIN)[2])
+        run(press(self.admin, ADMIN, "save_default"))
+        self.assertIn("הערה?", last("edit", ADMIN)[2])
+        run(text(self.admin, ADMIN, "רוצה לבוא לביקור באביב"))
+        done = last("reply", ADMIN)
+        self.assertIn("נשמר", done[2])
+        self.assertIn("אנשי קשר ✓ · טבלה ✓", done[2])
+        g = self.g()
+        self.assertEqual(len(g.rows), 1)
+        row = g.rows[0]
+        self.assertEqual((row["note"], row["event"], row["google_contact"]), ("רוצה לבוא לביקור באביב", "כנס גרמניה", "people/1"))
+        self.assertEqual(g.contacts["people/1"]["first_name_he"], "ניקיטה")
+        self.assertEqual(db.get_last_note(ADMIN), "רוצה לבוא לביקור באביב")
+        self.assertNotIn("pending_contact", self.admin.user_data)
+        self.assertFalse(any(e[0] == "contact" for e in log), "no contact card needed: Google syncs to the phone")
+
+    def test_brand_company_stays_in_original(self):
+        run(photo(self.admin, ADMIN, ANNA))
+        self.assertIn("אנה מולר · מנהלת מכירות · Siemens · Anna Muller", last("reply", ADMIN)[2])
+
+    def test_contacts_failure_keeps_sheet_row_and_retry_works(self):
+        self.g().fail_contacts = True
+        self._save(self.admin, ADMIN, NIKITA)
+        done = last("edit", ADMIN)
+        self.assertIn("טבלה ✓ · אנשי קשר ✗", done[2])
+        retry = buttons(done[3])[0]
+        self.assertEqual(self.g().rows[0]["google_contact"], "")
+        self.g().fail_contacts = False
+        run(press(self.admin, ADMIN, retry))
+        self.assertIn("נשמר באנשי קשר", last("edit", ADMIN)[2])
+        self.assertEqual(self.g().rows[0]["google_contact"], "people/1")
+
+    def test_sheet_failure_keeps_the_card_to_try_again(self):
+        self.g().fail_sheet = True
+        run(photo(self.admin, ADMIN, NIKITA))
+        run(press(self.admin, ADMIN, "save_default"))
+        run(press(self.admin, ADMIN, "note_skip"))
+        self.assertIn("השמירה לגוגל נכשלה", last("edit", ADMIN)[2])
+        self.assertIn("pending_contact", self.admin.user_data)
+        self.g().fail_sheet = False
+        run(press(self.admin, ADMIN, "save_default"))
+        run(press(self.admin, ADMIN, "note_skip"))
+        self.assertEqual(len(self.g().rows), 1)
+
+    def test_revoked_google_asks_to_reconnect(self):
+        self.g().refresh_error = True
+        handlers.parse_question = lambda q, d=None: {"date_from": None, "date_to": None, "terms": []}
+        run(text(self.admin, ADMIN, "מי"))
+        self.assertIn("התחברו מחדש", last("reply", ADMIN)[2])
+        self.assertIsNone(db.get_user(ADMIN)["refresh_token_enc"])
+
+    def test_note_repeat_skip_and_fast_scanning(self):
+        db.set_last_note(ADMIN, "כנס היין")
+        run(photo(self.admin, ADMIN, NIKITA))
+        run(press(self.admin, ADMIN, "save_default"))
+        self.assertIn("note_repeat", buttons(last("edit", ADMIN)[3]))
+        run(press(self.admin, ADMIN, "note_repeat"))
+        run(photo(self.admin, ADMIN, ANNA))
+        run(press(self.admin, ADMIN, "save_default"))
+        run(photo(self.admin, ADMIN, {**ANNA, "first_name": "Jurgen", "phone": "+49 170 0000001", "first_name_he": "יורגן"}))
+        self.assertTrue(any("נשמר בלי הערה" in e[2] for e in log if e[0] == "reply"))
+        notes = sorted(r["note"] for r in self.g().rows)
+        self.assertEqual(notes, ["", "כנס היין"])
+
+    def test_event_mode_and_expiry(self):
+        run(command(handlers.event_cmd, self.admin, ADMIN, "כנס", "גרמניה", "2026"))
+        self._save(self.admin, ADMIN, ANNA)
+        run(command(handlers.event_cmd, self.admin, ADMIN, "off"))
+        self._save(self.admin, ADMIN, NIKITA)
+        self.assertEqual({r["first_name"]: r["event"] for r in self.g().rows}, {"Anna": "כנס גרמניה 2026", "Nikita": ""})
+        db.set_event(ADMIN, "ישן")
+        db._run("UPDATE active_events SET expires_at = ? WHERE owner_id = ?", ((datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M"), ADMIN))
+        self.assertIsNone(db.get_event(ADMIN))
+
+    def test_duplicate_update_keeps_one_row_and_one_contact(self):
+        self._save(self.admin, ADMIN, NIKITA, "פגישה ראשונה")
+        run(photo(self.admin, ADMIN, {**NIKITA, "email": "new@mfa.bg"}))
+        preview = last("reply", ADMIN)
+        self.assertIn("כבר שמור", preview[2])
+        self.assertIn("save_update", buttons(preview[3]))
+        run(press(self.admin, ADMIN, "save_update"))
+        run(text(self.admin, ADMIN, "פגישה שנייה"))
+        g = self.g()
+        self.assertEqual(len(g.rows), 1)
+        self.assertEqual(g.rows[0]["email"], "new@mfa.bg")
+        self.assertEqual(g.rows[0]["note"], "פגישה ראשונה | פגישה שנייה")
+        self.assertEqual(list(g.contacts), ["people/1"])
+        self.assertEqual(g.contacts["people/1"]["email"], "new@mfa.bg")
+
+    def test_edit_hebrew_name_and_escaping(self):
+        run(photo(self.admin, ADMIN, NIKITA))
+        run(press(self.admin, ADMIN, "edit_field_name_he"))
+        run(text(self.admin, ADMIN, "ניקיטה <איוואנוב>"))
+        self.assertIn("ניקיטה &lt;איוואנוב&gt; · סגן שגריר", last("reply", ADMIN)[2])
+
+    # ---- questions and sharing
+
     def test_question_with_dates_and_terms_then_share(self):
         run(command(handlers.event_cmd, self.admin, ADMIN, "כנס", "גרמניה"))
         self._save(self.admin, ADMIN, ANNA, "דיברנו על הפצה")
         self._save(self.admin, ADMIN, NIKITA, "רוצה לבוא באביב")
-        # An old card from another month must not show up for "this week".
-        db._run("UPDATE cards SET scanned_at = '2026-01-05 10:00' WHERE first_name = 'Nikita'")
+        next(r for r in self.g().rows if r["first_name"] == "Nikita")["scanned_at"] = "2026-01-05 10:00"
         today = date.today().isoformat()
         handlers.parse_question = lambda q, d=None: {"date_from": today, "date_to": today, "terms": ["Germany", "גרמניה"]}
         run(text(self.admin, ADMIN, "את מי פגשנו היום בכנס הגרמני?"))
@@ -304,29 +404,193 @@ class PhaseA(unittest.TestCase):
         self.assertIn("2 אנשי קשר", doc[2])
         run(press(self.admin, ADMIN, "share_notes"))
         self.assertIn("הערה: רוצה לבוא באביב", last("document", ADMIN)[3])
-
-    def test_send_one_result(self):
-        self._save(self.admin, ADMIN, NIKITA)
-        card_id = db.all_cards(ADMIN)[0]["id"]
-        log.clear()
-        run(press(self.admin, ADMIN, f"send_{card_id}"))
-        self.assertIn("ניקיטה", last("contact", ADMIN)[2])
+        run(press(self.admin, ADMIN, f"send_{self.g().rows[0]['id']}"))
+        self.assertIn("אנה", last("contact", ADMIN)[2])
 
     def test_users_see_only_their_own_cards(self):
         db.request_access(OTHER, "Other", None)
         db.decide_access(OTHER, True)
+        connect(OTHER)
         self._save(self.admin, ADMIN, NIKITA)
         handlers.parse_question = lambda q, d=None: {"date_from": None, "date_to": None, "terms": ["Nikita"]}
         run(text(self.other, OTHER, "ניקיטה"))
         self.assertIn("לא מצאתי", last("edit", OTHER)[2])
-        card_id = db.all_cards(ADMIN)[0]["id"]
-        run(press(self.other, OTHER, f"send_{card_id}"))
-        self.assertFalse(any(e[0] == "contact" and e[1] == OTHER for e in log), "cannot fetch someone else's card")
+        run(press(self.other, OTHER, f"send_{self.g().rows[0]['id']}"))  # someone else's card id
+        self.assertFalse(any(e[0] == "contact" and e[1] == OTHER for e in log))
 
-    def test_no_results(self):
-        handlers.parse_question = lambda q, d=None: {"date_from": None, "date_to": None, "terms": ["nobody"]}
-        run(text(self.admin, ADMIN, "מי זה"))
-        self.assertIn("לא מצאתי", last("edit", ADMIN)[2])
+    def test_sheet_command(self):
+        run(command(handlers.sheet_cmd, self.admin, ADMIN))
+        self.assertIn("docs.google.com/spreadsheets", last("reply", ADMIN)[2])
+
+
+# ---------------------------------------------------------------- the Google layers themselves
+
+class FakeRequest:
+    def __init__(self, fn):
+        self.fn = fn
+
+    def execute(self):
+        return self.fn()
+
+
+class FakeSheetsService:
+    """Enough of the Sheets API for SheetStore: one spreadsheet, one tab of string cells."""
+
+    def __init__(self):
+        self.values: list[list[str]] = []
+        self.created = 0
+
+    def spreadsheets(self):
+        svc = self
+
+        class S:
+            def create(self, body, fields):
+                svc.created += 1
+                return FakeRequest(lambda: {"spreadsheetId": "sheet1"})
+
+            def get(self, spreadsheetId, fields):
+                return FakeRequest(lambda: {"spreadsheetId": spreadsheetId})
+
+            def values(self):
+                class V:
+                    def update(self, spreadsheetId, range, valueInputOption, body):
+                        def do():
+                            row = int("".join(ch for ch in range.split("!")[1].split(":")[0] if ch.isdigit()))
+                            while len(svc.values) < row:
+                                svc.values.append([])
+                            svc.values[row - 1] = body["values"][0]
+                            svc.last_update_range = range
+                            return {}
+                        return FakeRequest(do)
+
+                    def append(self, spreadsheetId, range, valueInputOption, insertDataOption, body):
+                        return FakeRequest(lambda: svc.values.append(body["values"][0]) or {})
+
+                    def get(self, spreadsheetId, range):
+                        return FakeRequest(lambda: {"values": [list(r) for r in svc.values]})
+                return V()
+        return S()
+
+
+class SheetStoreTests(unittest.TestCase):
+    def setUp(self):
+        db.init_db()
+        reset_db()
+        connect(ADMIN)
+        self.svc = FakeSheetsService()
+        with mock.patch.object(cards, "build", return_value=self.svc):
+            self.store = cards.SheetStore(None, ADMIN)
+
+    def test_creates_sheet_once_with_hebrew_header(self):
+        self.store.ensure()
+        self.store.ensure()
+        self.assertEqual(self.svc.created, 1)
+        self.assertEqual(self.svc.values[0][0], "שם בטלפון")
+        self.assertEqual(db.get_user(ADMIN)["sheet_id"], "sheet1")
+
+    def test_insert_read_update_roundtrip_keeps_phone_as_text(self):
+        cid = self.store.insert({**NIKITA, "scanned_at": "2026-10-13 10:00", "event": "כנס", "note": "הערה"})
+        card = self.store.get(cid)
+        self.assertEqual(card["display_name"], "ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov")
+        self.assertEqual(card["phone"], "+359 88 123 4567")
+        self.assertTrue(self.store.update(cid, {**card, "note": "עודכן"}))
+        self.assertEqual(self.store.get(cid)["note"], "עודכן")
+        self.assertTrue(self.svc.last_update_range.endswith("2"))
+
+    def test_reads_by_header_even_if_columns_moved_and_rows_typed_by_hand(self):
+        self.store.ensure()
+        header = self.svc.values[0]
+        self.svc.values[0] = list(reversed(header))  # the user reordered the columns
+        hand = [""] * len(header)
+        hand[header.index("מייל")] = "a@b.c"
+        hand[header.index("שם פרטי")] = "דנה"
+        self.svc.values.append(list(reversed(hand)))
+        card = self.store.all()[0]
+        self.assertEqual((card["email"], card["first_name_he"], card["id"]), ("a@b.c", "דנה", "r2"))
+
+
+class ContactsTests(unittest.TestCase):
+    def test_person_fields(self):
+        p = cards.ContactsClient._person({**NIKITA, "scanned_at": "2026-10-13 10:00", "event": "כנס", "note": "לחזור אליו", "website": "mfa.bg"})
+        self.assertEqual(p["names"][0]["givenName"], "ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov")
+        self.assertEqual(p["organizations"][0], {"name": "Embassy of Bulgaria", "title": "Deputy Ambassador"})
+        self.assertEqual(p["phoneNumbers"][0]["value"], "+359881234567")
+        self.assertEqual(p["urls"][0]["value"], "https://mfa.bg")
+        self.assertIn("הערה: לחזור אליו", p["biographies"][0]["value"])
+        self.assertIn("אירוע: כנס", p["biographies"][0]["value"])
+
+
+class GoogleAuthTests(unittest.TestCase):
+    def setUp(self):
+        db.init_db()
+        reset_db()
+
+    def test_login_link_state_is_single_use_and_tied_to_user(self):
+        url = google_auth.new_login_url(ADMIN)
+        self.assertIn("contacts", url)
+        self.assertIn("drive.file", url)
+        self.assertIn("access_type=offline", url)
+        state = url.split("state=")[1]
+        self.assertEqual(db.consume_oauth_state(state), ADMIN)
+        self.assertIsNone(db.consume_oauth_state(state), "second use refused")
+
+    def test_expired_state_refused(self):
+        db.create_oauth_state("old", ADMIN, minutes=-1)
+        self.assertIsNone(db.consume_oauth_state("old"))
+
+    def test_token_encryption(self):
+        enc = google_auth.encrypt("secret-refresh")
+        self.assertNotIn("secret", enc)
+        self.assertEqual(google_auth.decrypt(enc), "secret-refresh")
+
+    def test_email_from_id_token(self):
+        import base64, json
+        payload = base64.urlsafe_b64encode(json.dumps({"email": "y@gmail.com"}).encode()).decode().rstrip("=")
+        self.assertEqual(google_auth._email_from_id_token(f"h.{payload}.s"), "y@gmail.com")
+
+
+class OAuthCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        db.init_db()
+        reset_db()
+        log.clear()
+        self.client = TestClient(TestServer(web.make_app(Bot())))
+        await self.client.start_server()
+        self.ensure = mock.patch.object(web.cards, "open_user", side_effect=lambda uid: (SimpleNamespace(url=lambda: "https://sheet"), None))
+        self.ensure.start()
+
+    async def asyncTearDown(self):
+        self.ensure.stop()
+        await self.client.close()
+
+    async def _login(self, scopes):
+        state = google_auth.new_login_url(ADMIN).split("state=")[1]
+        with mock.patch.object(google_auth, "exchange_code", return_value=("y@gmail.com", "rt", scopes)):
+            return state, await self.client.get(f"/oauth/callback?state={state}&code=abc")
+
+    async def test_success_saves_encrypted_token_and_tells_the_user(self):
+        state, r = await self._login(list(web.NEEDED) + ["openid"])
+        self.assertEqual(r.status, 200)
+        u = db.get_user(ADMIN)
+        self.assertEqual(u["google_email"], "y@gmail.com")
+        self.assertEqual(google_auth.decrypt(u["refresh_token_enc"]), "rt")
+        self.assertIn("מחובר לגוגל", last("message", ADMIN)[2])
+        r2 = await self.client.get(f"/oauth/callback?state={state}&code=abc")
+        self.assertEqual(r2.status, 400, "a link works once")
+
+    async def test_missing_permission_is_refused(self):
+        _, r = await self._login(["openid", "https://www.googleapis.com/auth/contacts"])
+        self.assertEqual(r.status, 400)
+        self.assertIsNone((db.get_user(ADMIN) or {}).get("refresh_token_enc"))
+
+    async def test_unknown_state_and_cancel(self):
+        r = await self.client.get("/oauth/callback?state=nope&code=abc")
+        self.assertEqual(r.status, 400)
+        state = google_auth.new_login_url(ADMIN).split("state=")[1]
+        r = await self.client.get(f"/oauth/callback?state={state}&error=access_denied")
+        self.assertIn("בוטלה", last("message", ADMIN)[2])
 
 
 class QuestionParser(unittest.TestCase):
@@ -344,12 +608,11 @@ class QuestionParser(unittest.TestCase):
 
     def test_bad_dates_dropped(self):
         self._gemini('{"date_from": "last week", "date_to": null, "terms": ["Germany"]}')
-        self.assertEqual(extractor.parse_question("x")["date_from"], None)
+        self.assertIsNone(extractor.parse_question("x")["date_from"])
 
     def test_failure_falls_back_to_words(self):
         self._gemini(error=RuntimeError("down"))
-        f = extractor.parse_question("הבחור הרומני")
-        self.assertEqual(f, {"date_from": None, "date_to": None, "terms": ["הבחור", "הרומני"]})
+        self.assertEqual(extractor.parse_question("הבחור הרומני"), {"date_from": None, "date_to": None, "terms": ["הבחור", "הרומני"]})
 
 
 if __name__ == "__main__":

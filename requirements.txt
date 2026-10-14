@@ -3,3 +3,7 @@ google-genai
 pillow
 python-dotenv
 psycopg2-binary
+google-api-python-client
+google-auth
+cryptography
+aiohttp
