@@ -92,7 +92,7 @@ def credentials_for(telegram_id: int) -> Credentials:
         token_uri=TOKEN_URL,
         client_id=config.GOOGLE_CLIENT_ID,
         client_secret=config.GOOGLE_CLIENT_SECRET,
-        scopes=config.GOOGLE_SCOPES,
+        # No scopes here: Google reports "email" by its long name, and listing it only causes a warning on every refresh.
     )
 
 

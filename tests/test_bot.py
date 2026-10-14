@@ -549,6 +549,38 @@ class Bot_(unittest.TestCase):
         run(text(self.admin, ADMIN, "+359 (2) 111-2222"))
         self.assertIn("☎️ +35921112222", last("reply", ADMIN)[2])
 
+    def test_slow_telegram_download_is_retried_then_reported(self):
+        from telegram.error import TimedOut
+        tries = []
+
+        async def slow_file():
+            tries.append(1)
+            raise TimedOut()
+
+        handlers._pause = _no_sleep
+        u = upd(ADMIN)
+        u.message.photo = [SimpleNamespace(get_file=slow_file)]
+        run(handlers.handle_photo(u, self.admin))
+        self.assertEqual(len(tries), 3)
+        self.assertIn("שלחו אותה שוב", last("edit", ADMIN)[2])
+
+        # The second try works: the card is read normally.
+        calls = []
+
+        async def flaky_file():
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimedOut()
+            async def dl():
+                return bytearray(b"img")
+            return SimpleNamespace(download_as_bytearray=dl)
+
+        next_card.append(NIKITA)
+        u = upd(ADMIN)
+        u.message.photo = [SimpleNamespace(get_file=flaky_file)]
+        run(handlers.handle_photo(u, self.admin))
+        self.assertIn("save_default", buttons(last("reply", ADMIN)[3]))
+
     def test_busy_gemini_says_so_instead_of_blaming_the_photo(self):
         def busy(_b):
             raise extractor.GeminiBusy()
@@ -791,6 +823,10 @@ class GeminiFallback(unittest.TestCase):
     def test_list_response_is_unwrapped(self):
         self._client(['[{"first_name": "Barbara"}]'])
         self.assertEqual(extractor.extract_contact_info(_png())["first_name"], "Barbara")
+
+
+async def _no_sleep(_s):
+    return None
 
 
 def _png() -> bytes:

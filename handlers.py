@@ -9,6 +9,7 @@ from html import escape
 
 from google.auth.exceptions import RefreshError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError
 from telegram.ext import ContextTypes
 
 import cards
@@ -215,8 +216,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     second_side = context.user_data.get("waiting_second_side") and context.user_data.get("pending_contact")
     status = await message.reply_text("🔍 קורא את הצד השני…" if second_side else "🔍 קורא את הכרטיס…")
-    photo_file = await message.photo[-1].get_file()
-    photo_bytes = bytes(await photo_file.download_as_bytearray())
+    photo_bytes = await download(message.photo[-1])
+    if photo_bytes is None:
+        await status.edit_text("⚠️ טלגרם לא העביר את התמונה בזמן. שלחו אותה שוב.")
+        return
     try:
         new_data = await asyncio.to_thread(extract_contact_info, photo_bytes)
     except GeminiBusy:
@@ -238,6 +241,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text, markup = render_preview(data, context.user_data["duplicate"], db.get_event(user.id))
     await status.delete()
     await message.reply_text(text, reply_markup=markup, parse_mode=HTML)
+
+
+_pause = asyncio.sleep  # replaced in tests
+
+
+async def download(media, attempts: int = 3) -> bytes | None:
+    """A photo or voice file from Telegram; tries again when Telegram is slow. None if it never arrives."""
+    for attempt in range(attempts):
+        try:
+            f = await media.get_file()
+            return bytes(await f.download_as_bytearray())
+        except NetworkError as e:  # includes TimedOut
+            log.warning("telegram download failed (%s), attempt %d", type(e).__name__, attempt + 1)
+            await _pause(1 + attempt)
+    return None
 
 
 async def ask_for_note(message, context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -517,9 +535,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     voice = update.message.voice or update.message.audio
     status = await update.message.reply_text("🎙️ מקשיב…")
+    audio = await download(voice)
+    if audio is None:
+        await status.edit_text("⚠️ טלגרם לא העביר את ההקלטה בזמן. שלחו אותה שוב.")
+        return
     try:
-        f = await voice.get_file()
-        audio = bytes(await f.download_as_bytearray())
         text = await asyncio.to_thread(transcribe_audio, audio, getattr(voice, "mime_type", None) or "audio/ogg")
     except GeminiBusy:
         await status.edit_text(BUSY)

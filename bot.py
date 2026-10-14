@@ -29,7 +29,18 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # every Telegram poll would be logged otherwise
     init_db()
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    # Photos and voice files can be slow to download from Telegram; the 5-second defaults are too short.
+    app = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .connect_timeout(15)
+        .read_timeout(30)
+        .write_timeout(30)
+        .media_write_timeout(60)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("ping", handlers.ping))
