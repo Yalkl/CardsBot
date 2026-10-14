@@ -20,7 +20,7 @@ from formatters import build_display_name, contact_notes, english_name
 
 CONTACT_FIELDS = (
     "first_name", "last_name", "company", "job_title", "country",
-    "phone", "email", "website", "telegram", "address",
+    "phone", "phone_office", "email", "website", "telegram", "address",
     "first_name_he", "last_name_he", "job_title_he", "company_he",
 )
 
@@ -43,7 +43,8 @@ COLUMNS = [
     ("job_title", "Title"),
     ("company", "Company"),
     ("country", "מדינה"),
-    ("phone", "טלפון"),
+    ("phone", "נייד"),
+    ("phone_office", "טלפון משרד"),
     ("email", "מייל"),
     ("website", "אתר"),
     ("telegram", "טלגרם"),
@@ -52,6 +53,7 @@ COLUMNS = [
     ("id", "מזהה"),
 ]
 LABEL_TO_KEY = {label: key for key, label in COLUMNS}
+LABEL_TO_KEY["טלפון"] = "phone"  # the mobile column's header before office phones were added (14.10.2026)
 
 
 def _col_letter(n: int) -> str:
@@ -110,7 +112,7 @@ class SheetStore:
         out = []
         for i, row in enumerate(rows, start=2):
             card = {k: (row[j] if j < len(row) else "") for j, k in enumerate(keys) if k}
-            if not any(card.get(f) for f in ("first_name", "first_name_he", "company", "phone", "email")):
+            if not any(card.get(f) for f in ("first_name", "first_name_he", "company", "phone", "phone_office", "email")):
                 continue
             card["_row"] = i
             card["id"] = card.get("id") or f"r{i}"  # a row typed by hand: addressed by its row until saved again
@@ -126,9 +128,21 @@ class SheetStore:
         keys = [LABEL_TO_KEY.get(h.strip(), "") for h in header] or [k for k, _ in COLUMNS]
         return [str(card.get(k) or "") if k else "" for k in keys]
 
+    def _header(self) -> list[str]:
+        """The header row; columns added in a newer version are appended at the end, so old sheets keep working."""
+        header, _ = self._rows()
+        known = {LABEL_TO_KEY.get(h.strip()) for h in header}
+        missing = [label for key, label in COLUMNS if key not in known]
+        if header and missing:
+            header = header + missing
+            self.svc.spreadsheets().values().update(
+                spreadsheetId=self.sheet_id, range=f"'{TAB}'!A1", valueInputOption="RAW", body={"values": [header]}
+            ).execute()
+        return header
+
     def insert(self, card: dict) -> str:
         card = {**card, "id": card.get("id") or uuid.uuid4().hex[:10]}
-        header, _ = self._rows()
+        header = self._header()
         self.svc.spreadsheets().values().append(
             spreadsheetId=self.sheet_id, range=f"'{TAB}'!A1", valueInputOption="RAW",
             insertDataOption="INSERT_ROWS", body={"values": [self._row_values(card, header)]},
@@ -136,7 +150,7 @@ class SheetStore:
         return card["id"]
 
     def update(self, card_id: str, card: dict) -> bool:
-        header, _ = self._rows()
+        header = self._header()
         current = self.get(card_id)
         if not current:
             return False
@@ -169,6 +183,7 @@ class ContactsClient:
     @staticmethod
     def _person(card: dict) -> dict:
         phone = db.clean_phone_number(card.get("phone", ""))
+        office = db.clean_phone_number(card.get("phone_office", ""))
         website = (card.get("website") or "").strip()
         if website and not website.startswith("http"):
             website = f"https://{website}"
@@ -181,8 +196,11 @@ class ContactsClient:
             person["nicknames"] = [{"value": english_name(card)}]
         if card.get("company") or card.get("job_title"):
             person["organizations"] = [{"name": card.get("company") or "", "title": card.get("job_title") or ""}]
-        if phone:
-            person["phoneNumbers"] = [{"value": phone, "type": "mobile"}]
+        numbers = [{"value": phone, "type": "mobile"}] if phone else []
+        if office and office != phone:
+            numbers.append({"value": office, "type": "work"})
+        if numbers:
+            person["phoneNumbers"] = numbers
         if card.get("email"):
             person["emailAddresses"] = [{"value": card["email"], "type": "work"}]
         if website:
@@ -222,14 +240,21 @@ def open_user(telegram_id: int) -> tuple[SheetStore, ContactsClient]:
 # ---------------------------------------------------------------- matching and search (pure)
 
 def find_duplicate(cards: list[dict], data: dict) -> dict | None:
-    """Same person already saved? By phone (last 8 digits), then email, then full English name."""
-    digits = re.sub(r"\D", "", db.clean_phone_number(data.get("phone", "")))
+    """Same person already saved? By mobile or office number (last 8 digits), then email, then full English name."""
+    def tails(c: dict) -> set[str]:
+        out = set()
+        for f in ("phone", "phone_office"):
+            d = re.sub(r"\D", "", c.get(f) or "")
+            if len(d) >= 8:
+                out.add(d[-8:])
+        return out
+
+    mine = tails(data)
     email = (data.get("email") or "").strip().lower()
     full = english_name(data).lower()
     for card in cards:
-        card_digits = re.sub(r"\D", "", card.get("phone") or "")
         match = None
-        if len(digits) >= 8 and card_digits and digits[-8:] == card_digits[-8:]:
+        if mine & tails(card):
             match = "טלפון"
         elif email and (card.get("email") or "").strip().lower() == email:
             match = "מייל"
@@ -257,7 +282,7 @@ def search(cards: list[dict], terms: list[str], date_from: str | None = None, da
             scored.append((0, card))
             continue
         haystack = " | ".join(str(card.get(f) or "") for f in SEARCH_FIELDS).lower()
-        digits = re.sub(r"\D", "", card.get("phone") or "")
+        digits = re.sub(r"\D", "", f"{card.get('phone') or ''} {card.get('phone_office') or ''}")
         score = sum(1 for t in terms if t in haystack or (len(re.sub(r"\D", "", t)) >= 4 and re.sub(r"\D", "", t) in digits))
         if score:
             scored.append((score, card))

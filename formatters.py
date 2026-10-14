@@ -74,8 +74,11 @@ def generate_vcard(card: dict, include_note: bool = True) -> str:
         lines.append(f"ORG:{_vc(_s(data, 'company'))}")
     if _s(data, "job_title"):
         lines.append(f"TITLE:{_vc(_s(data, 'job_title'))}")
+    office = clean_phone_number(data.get("phone_office", ""))
     if phone:
-        lines.append(f"TEL;TYPE=CELL,WORK:{phone}")
+        lines.append(f"TEL;TYPE=CELL:{phone}")
+    if office and office != phone:
+        lines.append(f"TEL;TYPE=WORK,VOICE:{office}")
     if _s(data, "email"):
         lines.append(f"EMAIL;TYPE=INTERNET:{_s(data, 'email')}")
     if website:
@@ -93,7 +96,8 @@ def card_summary(data: dict) -> str:
     phone = clean_phone_number(data.get("phone", ""))
     rows = [f"<b>{escape(build_display_name(data))}</b>"]
     for icon, value in (
-        ("📞", phone),
+        ("📱", phone),
+        ("☎️", clean_phone_number(data.get("phone_office", ""))),
         ("✉️", _s(data, "email")),
         ("🌐", _s(data, "website")),
         ("✈️", _s(data, "telegram")),
@@ -109,7 +113,7 @@ def render_preview(data: dict, duplicate: dict | None = None, event: str | None 
     if duplicate:
         row = duplicate["row"]
         parts.append(f"⚠️ <b>כבר שמור</b> (לפי {duplicate['match_type']}): {escape(build_display_name(row))} · נסרק {escape((row.get('scanned_at') or '')[:10])}\n")
-    if not clean_phone_number(data.get("phone", "")):
+    if not clean_phone_number(data.get("phone", "")) and not clean_phone_number(data.get("phone_office", "")):
         parts.append("💡 לא נמצא טלפון. אם הוא בצד השני של הכרטיס, לחצו \"צד שני\".\n")
     parts.append(card_summary(data))
     if event:
@@ -138,7 +142,8 @@ EDIT_FIELDS = [
     ("name", "🔤 שם באנגלית"),
     ("job_title_he", "💼 תפקיד"),
     ("company", "🏢 חברה"),
-    ("phone", "📞 טלפון"),
+    ("phone", "📱 נייד"),
+    ("phone_office", "☎️ טלפון משרד"),
     ("email", "✉️ מייל"),
 ]
 
@@ -158,7 +163,9 @@ def render_results(rows: list[dict], header: str) -> tuple[str, InlineKeyboardMa
         meta = " · ".join(x for x in ((r.get("scanned_at") or "")[:10], r.get("event") or "") if x)
         lines.append(f"{i}. <b>{escape(build_display_name(r))}</b>")
         if r.get("phone"):
-            lines.append(f"   📞 {escape(r['phone'])}")
+            lines.append(f"   📱 {escape(r['phone'])}")
+        if r.get("phone_office"):
+            lines.append(f"   ☎️ {escape(r['phone_office'])}")
         if meta:
             lines.append(f"   <i>{escape(meta)}</i>")
         if r.get("note"):

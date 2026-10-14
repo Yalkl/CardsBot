@@ -21,6 +21,7 @@ def extract_contact_info(image_bytes: bytes, max_retries: int = 3) -> dict:
       "job_title": "",
       "country": "",
       "phone": "",
+      "phone_office": "",
       "email": "",
       "website": "",
       "telegram": "",
@@ -42,8 +43,10 @@ def extract_contact_info(image_bytes: bytes, max_retries: int = 3) -> dict:
     2. BUSINESS / STORE CARDS:
        - If there is NO individual person's name on the card (e.g. gym, spa, restaurant, clinic, hotel, salon), leave first_name/last_name empty and extract the business/brand name into "company" (infer from logo, text, or website domain).
 
-    3. PHONE NUMBERS:
-       - Extract only ONE primary mobile or direct phone number with international country code.
+    3. PHONE NUMBERS (with international country code):
+       - phone: the person's MOBILE number (marked Mob, Mobile, Cell, M, GSM, WhatsApp, моб., сот.).
+       - phone_office: the office / landline number (marked Tel, T, Phone, Office, Direct, тел., раб.). Never a fax.
+       - If the card has a single number and it is not clearly an office line, put it in phone and leave phone_office empty.
 
     4. LINKS & HANDLES:
        - WEBSITE: Extract full website address (e.g., "https://scultura.uz/").
@@ -96,7 +99,7 @@ _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Fields a spoken or typed update may change (anything else Gemini returns is dropped).
 UPDATABLE = (
     "first_name_he", "last_name_he", "first_name", "last_name", "job_title", "job_title_he",
-    "company", "company_he", "country", "phone", "email", "website", "telegram", "address", "event",
+    "company", "company_he", "country", "phone", "phone_office", "email", "website", "telegram", "address", "event",
 )
 
 
@@ -116,7 +119,7 @@ def parse_question(question: str, today: date | None = None) -> dict:
     You read a message a user sent to their business-card contacts bot, and return JSON.
     Today is {today.isoformat()} ({today.strftime("%A")}). Weeks start on Sunday.
     Contacts have: names (English and Hebrew letters), company, job title (English and Hebrew), country, city/address,
-    phone, email, website, telegram, the event where they were met (free text, often Hebrew, e.g. "כנס גרמניה 2026"),
+    mobile phone (phone), office phone (phone_office), email, website, telegram, the event where they were met (free text, often Hebrew, e.g. "כנס גרמניה 2026"),
     a personal note (Hebrew), and the date they were scanned.
 
     Decide the action:

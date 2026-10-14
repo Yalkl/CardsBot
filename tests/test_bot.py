@@ -523,6 +523,32 @@ class Bot_(unittest.TestCase):
         run(voice(self.stranger, STRANGER, "שלום"))
         self.assertIn("בקשת הגישה נשלחה", last("reply", STRANGER)[2])
 
+    # ---- mobile and office numbers
+
+    def test_mobile_and_office_numbers(self):
+        card = {**NIKITA, "phone_office": "+359 2 948 0000"}
+        run(photo(self.admin, ADMIN, card))
+        preview = last("reply", ADMIN)[2]
+        self.assertIn("📱 +359881234567", preview)
+        self.assertIn("☎️ +35929480000", preview)
+        run(press(self.admin, ADMIN, "save_default"))
+        run(press(self.admin, ADMIN, "note_skip"))
+        self.assertEqual(self.g().rows[0]["phone_office"], "+359 2 948 0000")
+        # Same person by the office number only: still a duplicate.
+        run(photo(self.admin, ADMIN, {**ANNA, "phone": "", "phone_office": "+359 2 948 0000", "first_name": "Other"}))
+        self.assertIn("כבר שמור", last("reply", ADMIN)[2])
+
+    def test_card_with_only_office_number_is_sent_as_contact(self):
+        self._save(self.admin, ADMIN, {**NIKITA, "phone": "", "phone_office": "+359 2 948 0000"})
+        run(press(self.admin, ADMIN, f"send_{self.g().rows[0]['id']}"))
+        self.assertIn("TEL;TYPE=WORK,VOICE:+35929480000", last("contact", ADMIN)[3])
+
+    def test_edit_office_number(self):
+        run(photo(self.admin, ADMIN, NIKITA))
+        run(press(self.admin, ADMIN, "edit_field_phone_office"))
+        run(text(self.admin, ADMIN, "+359 (2) 111-2222"))
+        self.assertIn("☎️ +35921112222", last("reply", ADMIN)[2])
+
     def test_sheet_command(self):
         run(command(handlers.sheet_cmd, self.admin, ADMIN))
         self.assertIn("docs.google.com/spreadsheets", last("reply", ADMIN)[2])
@@ -602,6 +628,19 @@ class SheetStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get(cid)["note"], "עודכן")
         self.assertTrue(self.svc.last_update_range.endswith("2"))
 
+    def test_old_sheet_gets_the_office_column_added(self):
+        self.store.ensure()
+        old_header = [label for key, label in cards.COLUMNS if key != "phone_office"]
+        old_header[old_header.index("נייד")] = "טלפון"  # the header before office numbers existed
+        self.svc.values = [old_header, [""] * len(old_header)]
+        self.svc.values[1][old_header.index("טלפון")] = "+972 50 111 2222"
+        self.svc.values[1][old_header.index("מזהה")] = "old1"
+        self.assertEqual(self.store.get("old1")["phone"], "+972 50 111 2222", "old rows still read")
+        cid = self.store.insert({**NIKITA, "phone_office": "+359 2 948 0000", "scanned_at": "2026-10-14 10:00"})
+        self.assertEqual(self.svc.values[0][-1], "טלפון משרד")
+        card = self.store.get(cid)
+        self.assertEqual((card["phone"], card["phone_office"]), ("+359 88 123 4567", "+359 2 948 0000"))
+
     def test_reads_by_header_even_if_columns_moved_and_rows_typed_by_hand(self):
         self.store.ensure()
         header = self.svc.values[0]
@@ -619,7 +658,9 @@ class ContactsTests(unittest.TestCase):
         p = cards.ContactsClient._person({**NIKITA, "scanned_at": "2026-10-13 10:00", "event": "כנס", "note": "לחזור אליו", "website": "mfa.bg"})
         self.assertEqual(p["names"][0]["givenName"], "ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov")
         self.assertEqual(p["organizations"][0], {"name": "Embassy of Bulgaria", "title": "Deputy Ambassador"})
-        self.assertEqual(p["phoneNumbers"][0]["value"], "+359881234567")
+        self.assertEqual(p["phoneNumbers"], [{"value": "+359881234567", "type": "mobile"}])
+        both = cards.ContactsClient._person({**NIKITA, "phone_office": "+359 2 948 0000"})
+        self.assertEqual(both["phoneNumbers"][1], {"value": "+35929480000", "type": "work"})
         self.assertEqual(p["urls"][0]["value"], "https://mfa.bg")
         self.assertIn("הערה: לחזור אליו", p["biographies"][0]["value"])
         self.assertIn("אירוע: כנס", p["biographies"][0]["value"])

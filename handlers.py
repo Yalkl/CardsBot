@@ -251,7 +251,7 @@ async def close_note_prompt(context: ContextTypes.DEFAULT_TYPE):
 async def send_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, card: dict):
     """A contact the phone can save in one tap; a .vcf file when there is no phone number."""
     vcard = generate_vcard(card)
-    phone = db.clean_phone_number(card.get("phone", ""))
+    phone = db.clean_phone_number(card.get("phone", "")) or db.clean_phone_number(card.get("phone_office", ""))
     if phone:
         await context.bot.send_contact(chat_id=chat_id, phone_number=phone, first_name=build_display_name(card), last_name="", vcard=vcard)
     else:
@@ -319,7 +319,8 @@ EDIT_PROMPTS = {
     "name": "שם באנגלית (First Last)",
     "job_title_he": "תפקיד",
     "company": "חברה, כפי שתוצג",
-    "phone": "טלפון",
+    "phone": "נייד",
+    "phone_office": "טלפון משרד",
     "email": "מייל",
 }
 
@@ -334,8 +335,8 @@ def apply_edit(data: dict, field: str, value: str):
         data["company_he"] = value  # shown in the name; the original company stays in its own field
         if not data.get("company"):
             data["company"] = value
-    elif field == "phone":
-        data["phone"] = db.clean_phone_number(value)
+    elif field in ("phone", "phone_office"):
+        data[field] = db.clean_phone_number(value)
     else:
         data[field] = value
 
@@ -558,7 +559,7 @@ def describe_filter(f: dict) -> str:
 FIELD_LABELS = {
     "first_name_he": "שם פרטי", "last_name_he": "שם משפחה", "first_name": "First name", "last_name": "Last name",
     "job_title": "Title", "job_title_he": "תפקיד", "company": "חברה", "company_he": "חברה (עברית)", "country": "מדינה",
-    "phone": "טלפון", "email": "מייל", "website": "אתר", "telegram": "טלגרם", "address": "כתובת", "event": "אירוע",
+    "phone": "נייד", "phone_office": "טלפון משרד", "email": "מייל", "website": "אתר", "telegram": "טלגרם", "address": "כתובת", "event": "אירוע",
 }
 
 
@@ -585,8 +586,9 @@ def _apply_update(store, contacts, card: dict, pending: dict) -> tuple[dict, boo
     updated = {**card, **pending["changes"]}
     if "company" in pending["changes"] and "company_he" not in pending["changes"]:
         updated["company_he"] = ""  # the old Hebrew name belonged to the old company
-    if "phone" in pending["changes"]:
-        updated["phone"] = db.clean_phone_number(updated["phone"])
+    for f in ("phone", "phone_office"):
+        if f in pending["changes"]:
+            updated[f] = db.clean_phone_number(updated[f])
     if pending.get("note"):
         if pending.get("note_mode") == "replace":
             updated["note"] = pending["note"]
