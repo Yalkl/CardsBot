@@ -203,14 +203,15 @@ async def voice(ctx, uid, spoken):
     await handlers.handle_voice(u, ctx)
 
 
-def search_filter(terms=None, date_from=None, date_to=None, groups=None):
+def search_filter(terms=None, date_from=None, date_to=None, groups=None, where=None):
     groups = groups if groups is not None else ([terms] if terms else [])
-    return {"action": "search", "date_from": date_from, "date_to": date_to, "groups": groups, "terms": [t for g in groups for t in g],
-            "who": [], "changes": {}, "note": None, "note_mode": "append"}
+    where = where if where is not None else [[] for _ in groups]
+    return {"action": "search", "date_from": date_from, "date_to": date_to, "groups": groups, "where": where,
+            "terms": [t for g in groups for t in g], "who": [], "changes": {}, "note": None, "note_mode": "append"}
 
 
 def update_filter(who, changes=None, note=None, note_mode="append"):
-    return {"action": "update", "date_from": None, "date_to": None, "groups": [], "terms": [], "who": who, "changes": changes or {}, "note": note, "note_mode": note_mode}
+    return {"action": "update", "date_from": None, "date_to": None, "groups": [], "where": [], "terms": [], "who": who, "changes": changes or {}, "note": note, "note_mode": note_mode}
 
 
 async def press(ctx, uid, data):
@@ -448,6 +449,40 @@ class Bot_(unittest.TestCase):
         self.assertNotIn("Shamshod", result, "Uzbekistan alone is not enough")
         self.assertNotIn("Ciprian", result, "Foreign Affairs alone is not enough")
         self.assertIn("· 1 אנשים", result)
+
+    def test_users_case_foreign_ministry_vs_embassies_with_mfa_emails(self):
+        """The 8 results of 14.10: 4 from the Uzbek MFA, 4 that only matched by email (mfa.bg ...) or by address."""
+        base = {**ANNA, "country": "", "email": "", "address": ""}
+        uz = {**base, "first_name": "Pulotjon", "company": "Ministry of Foreign Affairs of the Republic of Uzbekistan",
+              "company_he": "משרד החוץ של אוזבקיסטן", "country": "Uzbekistan", "phone": "+998 90 937 55 11"}
+        ph = {**base, "first_name": "Bekhbat", "company": "Ministry of Foreign Affairs of the Philippines",
+              "company_he": "משרד החוץ של הפיליפינים", "country": "Philippines", "address": "Tashkent, Uzbekistan", "phone": "+998 97 444 93 35"}
+        bg = {**base, "first_name": "Stoyana", "company": "Embassy of Bulgaria", "company_he": "שגרירות בולגריה", "country": "Bulgaria",
+              "email": "embassy.tashkent@mfa.bg", "address": "Tashkent, Uzbekistan", "phone": "+998 71 256 48 88"}
+        gr = {**base, "first_name": "Christos", "company": "Embassy of Greece", "country": "Greece",
+              "email": "gremb.tas@mfa.gr", "address": "Tashkent, Uzbekistan", "phone": "+30 694 776 9078"}
+        for c in (uz, ph, bg, gr):
+            self._save(self.admin, ADMIN, c)
+        handlers.parse_question = lambda q, d=None: search_filter(
+            groups=[["Ministry of Foreign Affairs", "MFA", "Foreign Affairs", "משרד החוץ"], ["Uzbekistan", "Uzbek", "אוזבקיסטן", "אוזבקי"]],
+            where=[["company"], ["company", "country"]],
+        )
+        run(text(self.admin, ADMIN, "את מי פגשתי במשרד החוץ האוזבקי?"))
+        result = last("edit", ADMIN)[2]
+        self.assertIn("Pulotjon", result)
+        for name in ("Bekhbat", "Stoyana", "Christos"):
+            self.assertNotIn(name, result)
+        # And "who is in Tashkent" does use the address.
+        handlers.parse_question = lambda q, d=None: search_filter(groups=[["Tashkent", "טשקנט"]], where=[["place"]])
+        run(text(self.admin, ADMIN, "מי בטשקנט"))
+        result = last("edit", ADMIN)[2]
+        for name in ("Bekhbat", "Stoyana", "Christos"):
+            self.assertIn(name, result)
+
+    def test_short_abbreviation_is_a_whole_word(self):
+        card = {"company": "Smfa Trading", "note": "met the MFA team"}
+        self.assertEqual(cards._hits(card, ["mfa"], ["company"]), 0)
+        self.assertEqual(cards._hits(card, ["mfa"], ["note"]), 1)
 
     def test_nothing_matches_everything_shows_closest_and_says_so(self):
         self._save(self.admin, ADMIN, ANNA)
@@ -899,9 +934,10 @@ class QuestionParser(unittest.TestCase):
         self.assertEqual(extractor.parse_question("x")["action"], "search")
 
     def test_groups_are_validated(self):
-        self._gemini('{"action": "search", "groups": [["MFA", "משרד החוץ", 7], [], "bad", ["Uzbekistan"]]}')
+        self._gemini('{"action": "search", "groups": [{"words": ["MFA", "משרד החוץ", 7], "in": ["company", "salary"]}, [], "bad", ["Uzbekistan"]]}')
         f = extractor.parse_question("את מי פגשתי במשרד החוץ האוזבקי?")
         self.assertEqual(f["groups"], [["MFA", "משרד החוץ", "7"], ["Uzbekistan"]])
+        self.assertEqual(f["where"], [["company"], []])
 
     def test_old_style_terms_become_one_group(self):
         self._gemini('{"action": "search", "terms": ["Germany", "גרמניה"]}')

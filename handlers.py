@@ -683,11 +683,12 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         await propose_update(status, context, f, all_cards)
         return
     groups = f.get("groups") or ([f["terms"]] if f.get("terms") else [])
-    matches = cards.search(all_cards, f.get("terms", []), f["date_from"], f["date_to"], limit=None, groups=groups)
+    where = f.get("where") or []
+    matches = cards.search(all_cards, f.get("terms", []), f["date_from"], f["date_to"], limit=None, groups=groups, where=where)
     desc = escape(describe_filter(f))
     note = ""
     if not matches and len(groups) > 1:
-        matches = cards.search_relaxed(all_cards, groups, f["date_from"], f["date_to"])
+        matches = cards.search_relaxed(all_cards, groups, f["date_from"], f["date_to"], where=where)
         note = "\nלא מצאתי מי שמתאים לכל הפרטים. הכי קרובים:" if matches else ""
     shown = matches[:SHOW]
     context.user_data["last_results"] = [r["id"] for r in matches[:SHARE_MAX]]

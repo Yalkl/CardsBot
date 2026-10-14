@@ -265,11 +265,31 @@ def find_duplicate(cards: list[dict], data: dict) -> dict | None:
     return None
 
 
-SEARCH_FIELDS = CONTACT_FIELDS + ("event", "note", "display_name")
+# Where a search group may look (extractor.WHERE). With no place given, everything except contact details:
+# an email like "...@mfa.bg" must not make a Bulgarian embassy look like "the MFA".
+WHERE_FIELDS = {
+    "name": ("first_name", "last_name", "first_name_he", "last_name_he"),
+    "company": ("company", "company_he"),
+    "title": ("job_title", "job_title_he"),
+    "country": ("country",),
+    "place": ("address", "country"),
+    "event": ("event",),
+    "note": ("note",),
+    "contact": ("email", "website", "telegram", "phone", "phone_office"),
+}
+DEFAULT_PLACES = ("name", "company", "title", "country", "place", "event", "note")
 
 
-def _hits(card: dict, terms: list[str]) -> int:
-    haystack = " | ".join(str(card.get(f) or "") for f in SEARCH_FIELDS).lower()
+def _term_in(term: str, text: str) -> bool:
+    """Substring match; a short term (an abbreviation like "MFA") must be a whole word."""
+    if len(term) <= 3:
+        return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text) is not None
+    return term in text
+
+
+def _hits(card: dict, terms: list[str], places: list[str] | None = None) -> int:
+    fields = {f for p in (places or DEFAULT_PLACES) for f in WHERE_FIELDS.get(p, ())}
+    haystack = " | ".join(str(card.get(f) or "") for f in sorted(fields)).lower()
     digits = re.sub(r"\D", "", f"{card.get('phone') or ''} {card.get('phone_office') or ''}")
     n = 0
     for t in terms:
@@ -277,19 +297,21 @@ def _hits(card: dict, terms: list[str]) -> int:
         if len(t) < 2:
             continue
         t_digits = re.sub(r"\D", "", t)
-        if t in haystack or (len(t_digits) >= 4 and t_digits in digits):
+        if _term_in(t, haystack) or (len(t_digits) >= 4 and t_digits == re.sub(r"[\s\-+()]", "", t) and t_digits in digits):
             n += 1
     return n
 
 
 def search(cards: list[dict], terms: list[str], date_from: str | None = None, date_to: str | None = None,
-           limit: int | None = 10, groups: list[list[str]] | None = None) -> list[dict]:
+           limit: int | None = 10, groups: list[list[str]] | None = None, where: list[list[str]] | None = None) -> list[dict]:
     """Cards in the date range (inclusive), best match first; no terms and no groups = everyone in the range.
 
     groups: each inner list is one requirement with its synonyms; a card must match every group (AND of ORs).
     terms (when no groups): a card must match at least one term.
     """
-    groups = [g for g in (groups or []) if g] or ([terms] if terms else [])
+    if not groups:
+        groups, where = ([terms], [[]]) if terms else ([], [])
+    where = list(where or []) + [[]] * (len(groups) - len(where or []))
     scored = []
     for card in cards:
         day = (card.get("scanned_at") or "")[:10]
@@ -297,7 +319,7 @@ def search(cards: list[dict], terms: list[str], date_from: str | None = None, da
             continue
         if date_to and day > date_to:
             continue
-        hits = [_hits(card, g) for g in groups]
+        hits = [_hits(card, g, w) for g, w in zip(groups, where)]
         if all(hits):
             scored.append((sum(hits), card))
     scored.sort(key=lambda s: s[0], reverse=True)  # stable: newest first within a score
@@ -305,14 +327,16 @@ def search(cards: list[dict], terms: list[str], date_from: str | None = None, da
     return out[:limit] if limit else out
 
 
-def search_relaxed(cards: list[dict], groups: list[list[str]], date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+def search_relaxed(cards: list[dict], groups: list[list[str]], date_from: str | None = None, date_to: str | None = None,
+                   where: list[list[str]] | None = None) -> list[dict]:
     """The closest cards when nothing matches every group: ranked by how many groups they match."""
+    where = list(where or []) + [[]] * (len(groups) - len(where or []))
     scored = []
     for card in cards:
         day = (card.get("scanned_at") or "")[:10]
         if (date_from and day < date_from) or (date_to and day > date_to):
             continue
-        matched = sum(1 for g in groups if _hits(card, g))
+        matched = sum(1 for g, w in zip(groups, where) if _hits(card, g, w))
         if matched:
             scored.append((matched, _hits(card, [t for g in groups for t in g]), card))
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
