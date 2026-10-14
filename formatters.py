@@ -1,186 +1,165 @@
+"""Text shown in Telegram and the contact files (docs/SPEC.md). Messages use HTML; user text is always escaped."""
+
 from datetime import datetime
+from html import escape
 import re
-from database import clean_phone_number
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-
-def build_formatted_name(data: dict, event_name: str = None) -> str:
-    """Constructs display name: BC [Event] | Name/Business - Organization/Country - Title."""
-    full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
-    company = (data.get("company") or "").strip()
-    country = (data.get("country") or "").strip()
-    job_title = (data.get("job_title") or "").strip()
-
-    primary = full_name if full_name else company
-    name_elements = [primary] if primary else []
-
-    if full_name:
-        entity = ""
-        if company and country:
-            if country.lower() in company.lower():
-                entity = country
-            else:
-                entity = f"{company} ({country})"
-        elif company:
-            entity = company
-        elif country:
-            entity = country
-
-        if entity:
-            name_elements.append(entity)
-    elif country:
-        name_elements.append(country)
-
-    if job_title:
-        name_elements.append(job_title)
-
-    base_info = " - ".join([el for el in name_elements if el]) or "Contact"
-
-    if event_name:
-        return f"BC [{event_name}] | {base_info}"
-    return f"BC | {base_info}"
+from database import clean_phone_number
 
 
-def _vcard_escape(text: str) -> str:
-    """Escapes free text for a vCard 3.0 value (backslash, comma, semicolon, newline)."""
-    return (
-        text.replace("\\", "\\\\")
-        .replace(",", "\\,")
-        .replace(";", "\\;")
-        .replace("\r\n", "\\n")
-        .replace("\n", "\\n")
-    )
+def _s(data: dict, key: str) -> str:
+    return (data.get(key) or "").strip()
 
 
-def generate_vcard(data: dict, event_name: str = None, note: str = None) -> str:
-    """Generates standard vCard 3.0 string with website, WhatsApp, and Telegram."""
-    formatted_name = build_formatted_name(data, event_name)
+def english_name(data: dict) -> str:
+    return f"{_s(data, 'first_name')} {_s(data, 'last_name')}".strip()
+
+
+def hebrew_name(data: dict) -> str:
+    return f"{_s(data, 'first_name_he')} {_s(data, 'last_name_he')}".strip()
+
+
+def build_display_name(data: dict) -> str:
+    """The name shown on the phone: "ניקיטה איבנוב · סגן שגריר · שגרירות בולגריה · Nikita Ivanov".
+
+    Hebrew name, title and institution when there are, otherwise the original; brand names stay as on the card.
+    """
+    he = hebrew_name(data)
+    en = english_name(data)
+    title = _s(data, "job_title_he") or _s(data, "job_title")
+    org = _s(data, "company_he") or _s(data, "company")
+    parts = [he or en, title, org]
+    if he and en:
+        parts.append(en)
+    return " · ".join(p for p in parts if p) or "איש קשר"
+
+
+def _vc(text: str) -> str:
+    """Escapes free text for a vCard 3.0 value."""
+    return text.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\r\n", "\\n").replace("\n", "\\n")
+
+
+def generate_vcard(data: dict, event: str | None = None, note: str | None = None, scanned_at: str | None = None, include_note: bool = True) -> str:
+    """vCard 3.0: the display name on top, the real fields below (company and title as on the card)."""
+    display = build_display_name(data)
     phone = clean_phone_number(data.get("phone", ""))
-    digits_only = re.sub(r"\D", "", phone)
-    wa_link = f"https://wa.me/{digits_only}" if digits_only else ""
-
-    tg_raw = (data.get("telegram") or "").strip().lstrip("@")
-    tg_link = f"https://t.me/{tg_raw}" if tg_raw else ""
-
-    website = (data.get("website") or "").strip()
+    digits = re.sub(r"\D", "", phone)
+    tg = _s(data, "telegram").lstrip("@")
+    website = _s(data, "website")
     if website and not website.startswith("http"):
         website = f"https://{website}"
 
-    today_str = datetime.now().strftime("%d/%m/%Y")
+    when = scanned_at[:10] if scanned_at else datetime.now().strftime("%Y-%m-%d")
+    notes = [f"נסרק {when}"]
+    if event:
+        notes.append(f"אירוע: {event}")
+    if note and include_note:
+        notes.append(f"הערה: {note}")
+    if digits:
+        notes.append(f"WhatsApp: https://wa.me/{digits}")
+    if tg:
+        notes.append(f"Telegram: https://t.me/{tg}")
 
-    notes = [f"📅 Scanned Date: {today_str}"]
-    if wa_link:
-        notes.append(f"💬 WhatsApp: {wa_link}")
-    if tg_link:
-        notes.append(f"✈️ Telegram: {tg_link}")
-    if website:
-        notes.append(f"🌐 Website: {website}")
-    if event_name:
-        notes.insert(0, f"🏷️ Event: {_vcard_escape(event_name)}")
-    if note:
-        notes.insert(0, f"📝 Note: {_vcard_escape(note)}")
-    note_content = "\\n".join(notes)
-
-    lines = [
-        "BEGIN:VCARD",
-        "VERSION:3.0",
-        f"N:;{formatted_name};;;",
-        f"FN:{formatted_name}",
-    ]
-    if data.get("company"):
-        lines.append(f"ORG:{data.get('company')}")
-    if data.get("job_title"):
-        lines.append(f"TITLE:{data.get('job_title')}")
+    lines = ["BEGIN:VCARD", "VERSION:3.0", f"N:;{_vc(display)};;;", f"FN:{_vc(display)}"]
+    if english_name(data):
+        lines.append(f"NICKNAME:{_vc(english_name(data))}")
+    if _s(data, "company"):
+        lines.append(f"ORG:{_vc(_s(data, 'company'))}")
+    if _s(data, "job_title"):
+        lines.append(f"TITLE:{_vc(_s(data, 'job_title'))}")
     if phone:
         lines.append(f"TEL;TYPE=CELL,WORK:{phone}")
-    if data.get("email"):
-        lines.append(f"EMAIL;TYPE=INTERNET:{data.get('email')}")
+    if _s(data, "email"):
+        lines.append(f"EMAIL;TYPE=INTERNET:{_s(data, 'email')}")
     if website:
         lines.append(f"URL;TYPE=WORK:{website}")
-    elif wa_link:
-        lines.append(f"URL:{wa_link}")
-    if data.get("address") or data.get("country"):
-        full_addr = f"{data.get('address', '')}, {data.get('country', '')}".strip(", ")
-        lines.append(f"ADR;TYPE=WORK:;;{full_addr};;;;")
-    lines.append(f"NOTE:{note_content}")
+    addr = ", ".join(x for x in (_s(data, "address"), _s(data, "country")) if x)
+    if addr:
+        lines.append(f"ADR;TYPE=WORK:;;{_vc(addr)};;;;")
+    lines.append(f"NOTE:{_vc(chr(10).join(notes))}")
     lines.append("END:VCARD")
+    return "\r\n".join(lines)
 
-    return "\n".join(lines)
 
-
-def render_preview(
-    data: dict, duplicate_info: dict = None
-) -> tuple[str, InlineKeyboardMarkup]:
-    """Builds the preview message and inline action buttons."""
-    name_preview = build_formatted_name(data)
+def card_summary(data: dict) -> str:
+    """The preview body: display name and the fields, HTML-escaped."""
     phone = clean_phone_number(data.get("phone", ""))
-    digits_only = re.sub(r"\D", "", phone)
-    wa_preview = f"https://wa.me/{digits_only}" if digits_only else "Not detected"
+    rows = [f"<b>{escape(build_display_name(data))}</b>"]
+    for icon, value in (
+        ("📞", phone),
+        ("✉️", _s(data, "email")),
+        ("🌐", _s(data, "website")),
+        ("✈️", _s(data, "telegram")),
+        ("🌍", ", ".join(x for x in (_s(data, "address"), _s(data, "country")) if x)),
+    ):
+        if value:
+            rows.append(f"{icon} {escape(value)}")
+    return "\n".join(rows)
 
-    tg_handle = (data.get("telegram") or "").strip()
-    tg_display = f"https://t.me/{tg_handle.lstrip('@')}" if tg_handle else "Not detected"
-    website_display = data.get("website") or "Not detected"
 
-    dup_alert = ""
-    if duplicate_info:
-        dup_alert = (
-            f"⚠️ **Duplicate Found in your History!**\n"
-            f"You previously scanned this contact on **{duplicate_info['date']}** "
-            f"as `{duplicate_info['name']}` ({duplicate_info['match_type']} matched).\n"
-        )
-        if duplicate_info.get("by"):
-            saved = "✅ saved to phone" if duplicate_info.get("saved") else "📵 not marked as saved to phone"
-            dup_alert += f"Scanned by {duplicate_info['by']} · {saved}\n"
-        dup_alert += "\n---\n"
+def render_preview(data: dict, duplicate: dict | None = None, event: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    parts = []
+    if duplicate:
+        row = duplicate["row"]
+        parts.append(f"⚠️ <b>כבר שמור</b> (לפי {duplicate['match_type']}): {escape(build_display_name(row))} · נסרק {escape((row.get('scanned_at') or '')[:10])}\n")
+    if not clean_phone_number(data.get("phone", "")):
+        parts.append("💡 לא נמצא טלפון. אם הוא בצד השני של הכרטיס, לחצו \"צד שני\".\n")
+    parts.append(card_summary(data))
+    if event:
+        parts.append(f"🏷️ אירוע: {escape(event)}")
 
-    missing_notice = ""
-    if not phone or (not data.get("first_name") and not data.get("company")):
-        missing_notice = (
-            "💡 **Missing info?** If there are details on the other side of the card, "
-            "tap **'📷 Scan Back Side'** to merge the info.\n\n---\n"
-        )
-
-    person_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
-
-    text = (
-        f"{dup_alert}"
-        f"{missing_notice}"
-        "📋 **Scanned Business Card Details:**\n\n"
-        f"🏷️ **Contact Name:** `{name_preview}`\n"
-        f"🏢 **Business / Company:** {data.get('company') or 'Not specified'}\n"
-        f"👤 **Person:** {person_name or 'None (Business Card)'}\n"
-        f"💼 **Title:** {data.get('job_title') or 'Not specified'}\n"
-        f"🌍 **Country:** {data.get('country') or 'Not specified'}\n"
-        f"📞 **Phone:** `{phone or 'Not detected'}`\n"
-        f"💬 **WhatsApp:** {wa_preview}\n"
-        f"✈️ **Telegram:** {tg_display}\n"
-        f"🌐 **Website:** {website_display}\n"
-        f"✉️ **Email:** {data.get('email') or 'Not specified'}\n"
-        f"📍 **Address:** {data.get('address') or 'Not specified'}\n\n"
-        "How would you like to proceed?"
-    )
-
-    btn_label = (
-        "🔄 Update / Send Contact Anyway"
-        if duplicate_info
-        else "✅ Save Default"
-    )
-
+    if duplicate:
+        first_row = [
+            InlineKeyboardButton("🔄 עדכן את הקיים", callback_data="save_update"),
+            InlineKeyboardButton("➕ שמור כחדש", callback_data="save_default"),
+        ]
+    else:
+        first_row = [InlineKeyboardButton("✅ שמור", callback_data="save_default")]
     keyboard = [
-        [InlineKeyboardButton(btn_label, callback_data="save_default")],
+        first_row,
         [
-            InlineKeyboardButton(
-                "📷 Scan Back Side (Merge)", callback_data="scan_second_side"
-            ),
-            InlineKeyboardButton(
-                "🏷️ Assign Event", callback_data="ask_event"
-            ),
+            InlineKeyboardButton("✏️ תיקון", callback_data="open_edit_menu"),
+            InlineKeyboardButton("📷 צד שני", callback_data="scan_second_side"),
         ],
-        [
-            InlineKeyboardButton(
-                "✏️ Edit Details", callback_data="open_edit_menu"
-            )
-        ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        [InlineKeyboardButton("❌ ביטול", callback_data="cancel")],
     ]
-    return text, InlineKeyboardMarkup(keyboard)
+    return "\n".join(parts), InlineKeyboardMarkup(keyboard)
+
+
+EDIT_FIELDS = [
+    ("name_he", "👤 שם בעברית"),
+    ("name", "🔤 שם באנגלית"),
+    ("job_title_he", "💼 תפקיד"),
+    ("company", "🏢 חברה"),
+    ("phone", "📞 טלפון"),
+    ("email", "✉️ מייל"),
+]
+
+
+def edit_menu() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"edit_field_{key}")] for key, label in EDIT_FIELDS]
+    rows.append([InlineKeyboardButton("🔙 חזרה", callback_data="back_to_preview")])
+    return InlineKeyboardMarkup(rows)
+
+
+def render_results(rows: list[dict], header: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Search results: one line per person with company, date, event and note; a button per person and "share all"."""
+    if not rows:
+        return f"{header}\n\nלא מצאתי אף אחד.", None
+    lines = [header, ""]
+    for i, r in enumerate(rows, 1):
+        meta = " · ".join(x for x in ((r.get("scanned_at") or "")[:10], r.get("event") or "") if x)
+        lines.append(f"{i}. <b>{escape(build_display_name(r))}</b>")
+        if r.get("phone"):
+            lines.append(f"   📞 {escape(r['phone'])}")
+        if meta:
+            lines.append(f"   <i>{escape(meta)}</i>")
+        if r.get("note"):
+            lines.append(f"   📝 {escape(r['note'])}")
+    buttons = [InlineKeyboardButton(f"📇 {i}", callback_data=f"send_{r['id']}") for i, r in enumerate(rows, 1)]
+    keyboard = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    if len(rows) > 1:
+        keyboard.append([InlineKeyboardButton(f"📤 שתף את כל ה-{len(rows)}", callback_data="share_all")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)

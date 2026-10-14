@@ -11,27 +11,19 @@ from telegram.ext import (
 
 
 def main():
-    # Initialize Database table
     init_db()
-
-    # Build Telegram Bot Application
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register Handlers
     app.add_handler(CommandHandler("start", handlers.start))
     app.add_handler(CommandHandler("ping", handlers.ping))
     app.add_handler(CommandHandler("myid", handlers.myid))
+    app.add_handler(CommandHandler("event", handlers.event_cmd))
+    app.add_handler(CommandHandler("ask", handlers.ask_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
     app.add_handler(CallbackQueryHandler(handlers.handle_callback))
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND, handlers.handle_text_input
-        )
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text_input))
 
-    print(
-        "🤖 Telegram Business Card Bot (Modular Structure) is running..."
-    )
+    print("CardsBot is running")
     app.run_polling(drop_pending_updates=True)
 
 

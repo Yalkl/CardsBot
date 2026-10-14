@@ -1,71 +1,95 @@
-from datetime import datetime
+"""Storage (docs/SPEC.md): PostgreSQL when DATABASE_URL is set, SQLite otherwise (local runs and tests).
+
+Every contact belongs to the Telegram user who scanned it (owner_id); every read is filtered by it.
+"""
+
+from datetime import datetime, timedelta
 import re
 import sqlite3
-from config import DATABASE_URL, LOCAL_SQLITE_PATH
+
 import psycopg2
 
-# Card fields stored for each contact, in display order.
+import config
+
+# Card fields, as extracted (Latin script) plus the Hebrew display fields.
 CONTACT_FIELDS = (
     "first_name", "last_name", "company", "job_title", "country",
     "phone", "email", "website", "telegram", "address",
+    "first_name_he", "last_name_he", "job_title_he", "company_he",
 )
 
 
 def get_db_connection():
-    """Returns PostgreSQL connection if DATABASE_URL is set, else SQLite connection."""
-    if DATABASE_URL:
-        return psycopg2.connect(DATABASE_URL)
-    return sqlite3.connect(LOCAL_SQLITE_PATH)
+    if config.DATABASE_URL:
+        return psycopg2.connect(config.DATABASE_URL)
+    return sqlite3.connect(config.LOCAL_SQLITE_PATH)
+
+
+def _pg() -> bool:
+    return bool(config.DATABASE_URL)
 
 
 def _sql(query: str) -> str:
     """Queries are written with '?' placeholders; PostgreSQL wants '%s'."""
-    return query.replace("?", "%s") if DATABASE_URL else query
+    return query.replace("?", "%s") if _pg() else query
 
 
-def _fetch_dicts(cursor) -> list[dict]:
-    names = [d[0] for d in cursor.description]
-    return [dict(zip(names, row)) for row in cursor.fetchall()]
+def _run(query: str, params: tuple = (), fetch: str | None = None):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(_sql(query), params)
+        out = None
+        if fetch == "all":
+            names = [d[0] for d in cur.description]
+            out = [dict(zip(names, row)) for row in cur.fetchall()]
+        elif fetch == "one":
+            row = cur.fetchone()
+            out = dict(zip([d[0] for d in cur.description], row)) if row else None
+        elif fetch == "rowcount":
+            out = cur.rowcount
+        conn.commit()
+        cur.close()
+        return out
+    finally:
+        conn.close()
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 def init_db():
-    """Initializes user_contacts (per-user scan history) and contacts (shared team list)."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    pk = "SERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
-    uid = "BIGINT" if DATABASE_URL else "INTEGER"
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS user_contacts (
-            id {pk},
-            user_id {uid} NOT NULL,
-            full_name TEXT,
-            phone TEXT,
-            email TEXT,
-            scanned_date TEXT
-        );
-    """
-    )
-    fields = ",\n".join(f"            {f} TEXT" for f in CONTACT_FIELDS)
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS contacts (
-            id {pk},
-            workspace TEXT NOT NULL,
-            scanned_by_id {uid} NOT NULL,
-            scanned_by_name TEXT,
-            scanned_at TEXT NOT NULL,
+    pk = "SERIAL PRIMARY KEY" if _pg() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    big = "BIGINT" if _pg() else "INTEGER"
+    fields = ",\n".join(f"    {f} TEXT" for f in CONTACT_FIELDS)
+    for stmt in (
+        f"""CREATE TABLE IF NOT EXISTS users (
+    telegram_id {big} PRIMARY KEY,
+    name TEXT,
+    username TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TEXT,
+    decided_at TEXT,
+    last_note TEXT
+)""",
+        f"""CREATE TABLE IF NOT EXISTS cards (
+    id {pk},
+    owner_id {big} NOT NULL,
+    scanned_at TEXT NOT NULL,
 {fields},
-            event TEXT,
-            note TEXT,
-            saved_to_phone INTEGER NOT NULL DEFAULT 0
-        );
-    """
-    )
-    cursor.execute("CREATE INDEX IF NOT EXISTS contacts_workspace_idx ON contacts (workspace);")
-    conn.commit()
-    cursor.close()
-    conn.close()
+    event TEXT,
+    note TEXT,
+    google_resource TEXT
+)""",
+        "CREATE INDEX IF NOT EXISTS cards_owner_idx ON cards (owner_id)",
+        f"""CREATE TABLE IF NOT EXISTS active_events (
+    owner_id {big} PRIMARY KEY,
+    name TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+)""",
+    ):
+        _run(stmt)
 
 
 def clean_phone_number(phone_str: str) -> str:
@@ -75,187 +99,158 @@ def clean_phone_number(phone_str: str) -> str:
     return re.sub(r"[^\d+]", "", phone_str)
 
 
-def _match_type(digits: str, email: str, full_name: str, row_name: str, row_phone: str, row_email: str):
-    """Returns 'Phone', 'Email' or 'Name' when the row looks like the same person, else None."""
-    row_digits = re.sub(r"\D", "", clean_phone_number(row_phone))
-    row_clean_name = row_name.strip().lower() if row_name else ""
+# ---------------------------------------------------------------- users and approval
 
-    # 1. Phone Match (last 8 digits)
-    if digits and row_digits:
-        if (
-            digits == row_digits
-            or digits.endswith(row_digits[-8:])
-            or row_digits.endswith(digits[-8:])
-        ):
-            return "Phone"
-
-    # 2. Email Match
-    if email and row_email and email == row_email.strip().lower():
-        return "Email"
-
-    # 3. Name Match
-    if full_name and len(full_name) > 3 and full_name in row_clean_name:
-        return "Name"
-    return None
+def get_user(telegram_id: int) -> dict | None:
+    return _run("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,), "one")
 
 
-def _match_keys(first_name: str, last_name: str, phone: str, email: str):
-    digits = re.sub(r"\D", "", clean_phone_number(phone))
-    cleaned_email = email.strip().lower() if email else ""
-    target_first = first_name.strip().lower() if first_name else ""
-    target_last = last_name.strip().lower() if last_name else ""
-    return digits, cleaned_email, f"{target_first} {target_last}".strip()
+def is_approved(telegram_id: int) -> bool:
+    if config.ADMIN_TELEGRAM_ID and telegram_id == config.ADMIN_TELEGRAM_ID:
+        return True
+    u = get_user(telegram_id)
+    return bool(u and u["status"] == "approved")
 
 
-def check_duplicate_contact(
-    user_id: int, first_name: str, last_name: str, phone: str, email: str
-):
-    """Checks if this specific user already scanned a contact by Phone, Email, or Name."""
-    keys = _match_keys(first_name, last_name, phone, email)
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        _sql("SELECT full_name, phone, email, scanned_date FROM user_contacts WHERE user_id = ?"),
-        (user_id,),
+def request_access(telegram_id: int, name: str, username: str | None) -> str:
+    """Creates a pending request if there is none. Returns the user's status."""
+    u = get_user(telegram_id)
+    if u:
+        return u["status"]
+    _run(
+        "INSERT INTO users (telegram_id, name, username, status, requested_at) VALUES (?, ?, ?, 'pending', ?)",
+        (telegram_id, name, username, now_str()),
     )
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    for row_name, row_phone, row_email, row_date in rows:
-        match = _match_type(*keys, row_name, row_phone, row_email)
-        if match:
-            return {"name": row_name, "phone": row_phone, "email": row_email, "date": row_date, "match_type": match}
-    return None
+    return "pending"
 
 
-def record_saved_contact(user_id: int, data: dict):
-    """Saves the scanned contact into database for future duplicate checks."""
-    full_name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
-    phone = clean_phone_number(data.get("phone", ""))
-    email = data.get("email", "").strip()
-    today_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        _sql("INSERT INTO user_contacts (user_id, full_name, phone, email, scanned_date) VALUES (?, ?, ?, ?, ?)"),
-        (user_id, full_name, phone, email, today_str),
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+def decide_access(telegram_id: int, approve: bool) -> bool:
+    """Sets approved/denied. Returns False if there is no such request."""
+    return bool(_run(
+        "UPDATE users SET status = ?, decided_at = ? WHERE telegram_id = ?",
+        ("approved" if approve else "denied", now_str(), telegram_id),
+        "rowcount",
+    ))
 
 
-# ---------- Shared team contacts ----------
+def get_last_note(telegram_id: int) -> str | None:
+    u = get_user(telegram_id)
+    return u["last_note"] if u else None
 
-def insert_contact(workspace: str, user_id: int, user_name: str, data: dict, event: str | None, note: str | None) -> int:
-    """Stores a full contact in the shared list. Returns its id."""
+
+def set_last_note(telegram_id: int, note: str):
+    if not get_user(telegram_id):  # the admin may never have requested access
+        _run("INSERT INTO users (telegram_id, status, requested_at) VALUES (?, 'approved', ?)", (telegram_id, now_str()))
+    _run("UPDATE users SET last_note = ? WHERE telegram_id = ?", (note, telegram_id))
+
+
+# ---------------------------------------------------------------- active event
+
+def set_event(owner_id: int, name: str | None):
+    _run("DELETE FROM active_events WHERE owner_id = ?", (owner_id,))
+    if name:
+        expires = (datetime.now() + timedelta(hours=config.EVENT_HOURS)).strftime("%Y-%m-%d %H:%M")
+        _run("INSERT INTO active_events (owner_id, name, expires_at) VALUES (?, ?, ?)", (owner_id, name, expires))
+
+
+def get_event(owner_id: int) -> str | None:
+    row = _run("SELECT name, expires_at FROM active_events WHERE owner_id = ?", (owner_id,), "one")
+    if not row:
+        return None
+    if row["expires_at"] < now_str():
+        set_event(owner_id, None)
+        return None
+    return row["name"]
+
+
+# ---------------------------------------------------------------- cards
+
+def insert_card(owner_id: int, data: dict, event: str | None, note: str | None) -> int:
     values = [(data.get(f) or "").strip() for f in CONTACT_FIELDS]
     values[CONTACT_FIELDS.index("phone")] = clean_phone_number(data.get("phone", ""))
-    cols = ", ".join(("workspace", "scanned_by_id", "scanned_by_name", "scanned_at") + CONTACT_FIELDS + ("event", "note"))
-    marks = ", ".join(["?"] * (4 + len(CONTACT_FIELDS) + 2))
-    params = (workspace, user_id, user_name, datetime.now().strftime("%Y-%m-%d %H:%M"), *values, event or "", note or "")
-
+    cols = ", ".join(("owner_id", "scanned_at") + CONTACT_FIELDS + ("event", "note"))
+    marks = ", ".join(["?"] * (2 + len(CONTACT_FIELDS) + 2))
+    params = (owner_id, now_str(), *values, event or "", note or "")
+    if _pg():
+        return _run(f"INSERT INTO cards ({cols}) VALUES ({marks}) RETURNING id", params, "one")["id"]
     conn = get_db_connection()
-    cursor = conn.cursor()
-    if DATABASE_URL:
-        cursor.execute(_sql(f"INSERT INTO contacts ({cols}) VALUES ({marks}) RETURNING id"), params)
-        new_id = cursor.fetchone()[0]
-    else:
-        cursor.execute(f"INSERT INTO contacts ({cols}) VALUES ({marks})", params)
-        new_id = cursor.lastrowid
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return new_id
+    try:
+        cur = conn.cursor()
+        cur.execute(f"INSERT INTO cards ({cols}) VALUES ({marks})", params)
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
 
 
-def _select(query: str, params: tuple) -> list[dict]:
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(_sql(query), params)
-    rows = _fetch_dicts(cursor)
-    cursor.close()
-    conn.close()
-    return rows
-
-
-def get_contact(workspace: str, contact_id: int) -> dict | None:
-    rows = _select("SELECT * FROM contacts WHERE workspace = ? AND id = ?", (workspace, contact_id))
-    return rows[0] if rows else None
-
-
-def all_contacts(workspace: str) -> list[dict]:
-    return _select("SELECT * FROM contacts WHERE workspace = ? ORDER BY scanned_at DESC, id DESC", (workspace,))
-
-
-def list_unsaved(workspace: str, user_id: int, limit: int = 20) -> list[dict]:
-    """Contacts this user scanned but has not marked as saved to their phone, newest first."""
-    rows = _select(
-        "SELECT * FROM contacts WHERE workspace = ? AND scanned_by_id = ? AND saved_to_phone = 0 "
-        "ORDER BY scanned_at DESC, id DESC",
-        (workspace, user_id),
+def update_card(owner_id: int, card_id: int, data: dict, event: str | None, note: str | None) -> bool:
+    """Updates an existing card with the new scan: non-empty new values win; the new note is appended."""
+    old = get_card(owner_id, card_id)
+    if not old:
+        return False
+    merged = {f: (data.get(f) or "").strip() or (old.get(f) or "") for f in CONTACT_FIELDS}
+    merged["phone"] = clean_phone_number(merged["phone"])
+    notes = [n for n in (old.get("note"), note) if n]
+    sets = ", ".join(f"{f} = ?" for f in CONTACT_FIELDS)
+    _run(
+        f"UPDATE cards SET {sets}, event = ?, note = ?, scanned_at = ? WHERE owner_id = ? AND id = ?",
+        (*[merged[f] for f in CONTACT_FIELDS], event or old.get("event") or "", " | ".join(notes), now_str(), owner_id, card_id),
     )
-    return rows[:limit]
+    return True
 
 
-def mark_saved(workspace: str, contact_id: int, user_id: int) -> bool:
-    """Marks a contact as saved to the scanner's phone. Only the person who scanned it can mark it."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        _sql("UPDATE contacts SET saved_to_phone = 1 WHERE workspace = ? AND id = ? AND scanned_by_id = ?"),
-        (workspace, contact_id, user_id),
-    )
-    changed = cursor.rowcount > 0
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return changed
+def get_card(owner_id: int, card_id: int) -> dict | None:
+    return _run("SELECT * FROM cards WHERE owner_id = ? AND id = ?", (owner_id, card_id), "one")
 
 
-def find_team_duplicate(workspace: str, data: dict) -> dict | None:
-    """Same matching as check_duplicate_contact, against the shared list (so Tamar sees Yehuda's scans)."""
-    keys = _match_keys(data.get("first_name", ""), data.get("last_name", ""), data.get("phone", ""), data.get("email", ""))
-    for row in all_contacts(workspace):
-        row_name = f"{row['first_name'] or ''} {row['last_name'] or ''}".strip() or (row["company"] or "")
-        match = _match_type(*keys, row_name, row["phone"], row["email"])
+def all_cards(owner_id: int) -> list[dict]:
+    return _run("SELECT * FROM cards WHERE owner_id = ? ORDER BY scanned_at DESC, id DESC", (owner_id,), "all")
+
+
+def find_duplicate(owner_id: int, data: dict) -> dict | None:
+    """Same person already saved? By phone (last 8 digits), then email, then full name."""
+    digits = re.sub(r"\D", "", clean_phone_number(data.get("phone", "")))
+    email = (data.get("email") or "").strip().lower()
+    full = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip().lower()
+    for row in all_cards(owner_id):
+        row_digits = re.sub(r"\D", "", row.get("phone") or "")
+        row_full = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip().lower()
+        match = None
+        if digits and row_digits and (digits[-8:] == row_digits[-8:]):
+            match = "טלפון"
+        elif email and (row.get("email") or "").strip().lower() == email:
+            match = "מייל"
+        elif full and len(full) > 3 and full == row_full:
+            match = "שם"
         if match:
-            return {
-                "id": row["id"],
-                "name": row_name,
-                "date": row["scanned_at"],
-                "match_type": match,
-                "by": row["scanned_by_name"],
-                "by_id": row["scanned_by_id"],
-                "saved": bool(row["saved_to_phone"]),
-            }
+            return {"id": row["id"], "row": row, "match_type": match}
     return None
 
 
-SEARCH_FIELDS = CONTACT_FIELDS + ("event", "note", "scanned_by_name")
+SEARCH_FIELDS = CONTACT_FIELDS + ("event", "note")
 
 
-def search_contacts(workspace: str, terms: list[str], limit: int = 10) -> list[dict]:
-    """Ranks contacts by how many search terms appear in any field (case-insensitive substring).
+def search_cards(owner_id: int, terms: list[str], date_from: str | None = None, date_to: str | None = None, limit: int = 10) -> list[dict]:
+    """Cards in the date range (inclusive, YYYY-MM-DD) ranked by how many terms appear in any field.
 
-    The list is small (hundreds of people), so filtering in Python keeps SQLite and PostgreSQL identical.
+    With no terms, every card in the range matches. The list is small, so this runs in Python and
+    behaves the same on SQLite and PostgreSQL.
     """
     terms = [t.strip().lower() for t in terms if t and len(t.strip()) >= 2]
-    if not terms:
-        return []
     scored = []
-    for row in all_contacts(workspace):
+    for row in all_cards(owner_id):
+        day = (row.get("scanned_at") or "")[:10]
+        if date_from and day < date_from:
+            continue
+        if date_to and day > date_to:
+            continue
+        if not terms:
+            scored.append((0, row))
+            continue
         haystack = " | ".join(str(row.get(f) or "") for f in SEARCH_FIELDS).lower()
         digits = re.sub(r"\D", "", row.get("phone") or "")
-        score = 0
-        for t in terms:
-            t_digits = re.sub(r"\D", "", t)
-            if t in haystack or (len(t_digits) >= 4 and t_digits == t.replace("+", "").replace("-", "").replace(" ", "") and t_digits in digits):
-                score += 1
+        score = sum(1 for t in terms if t in haystack or (len(re.sub(r"\D", "", t)) >= 4 and re.sub(r"\D", "", t) in digits))
         if score:
             scored.append((score, row))
-    scored.sort(key=lambda s: s[0], reverse=True)  # stable: newest first within the same score
+    scored.sort(key=lambda s: s[0], reverse=True)  # stable: newest first within a score
     return [row for _, row in scored[:limit]]
