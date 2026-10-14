@@ -60,11 +60,66 @@ async def health(_request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+# Google requires a home page and a privacy policy for an app in production (Google Auth Platform → Branding).
+HOME_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>CardsBot</title>
+<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.6}</style></head><body>
+<h1>CardsBot</h1>
+<p>A private Telegram bot that reads a business card photo and saves the person to the user's own Google Contacts,
+with a row in a Google Sheet in the user's own Drive. Access is by invitation only.</p>
+<p><a href="/privacy">Privacy policy</a></p>
+</body></html>"""
+
+PRIVACY_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>CardsBot – Privacy policy</title>
+<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;line-height:1.6}</style></head><body>
+<h1>CardsBot – Privacy policy</h1>
+<p>Last updated: 14 October 2026</p>
+<h2>What the bot does</h2>
+<p>CardsBot is a private Telegram bot, used by invitation only. When a user sends a photo of a business card, the bot reads the
+text and, with the user's permission, saves the contact in the user's own Google account.</p>
+<h2>Google data the bot uses</h2>
+<ul>
+<li><b>Google Contacts</b> (contacts scope): to create and update the contacts the user scans. The bot does not read or change other contacts.</li>
+<li><b>Google Drive</b> (drive.file scope): to create one Google Sheet that lists the scanned cards, and to read and update that sheet only.
+The bot cannot see any other file in the user's Drive.</li>
+<li><b>Email address</b>: to show the user which Google account is connected.</li>
+</ul>
+<h2>What is stored, and where</h2>
+<ul>
+<li>The contacts and the sheet stay in the user's own Google account.</li>
+<li>The bot's server stores only: the user's Telegram id, approval status, connected email, the id of the sheet it created,
+and the Google refresh token, encrypted.</li>
+<li>Card photos are not stored. They are sent to Google Gemini to read the text, and then discarded.</li>
+<li>Search questions are sent to Google Gemini only to turn them into a search filter. The contact list is never sent.</li>
+</ul>
+<h2>Sharing</h2>
+<p>Data is not sold or shared with anyone. It is used only to provide the features above, to the user who scanned the card.
+The use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.</p>
+<h2>Removing access and data</h2>
+<p>Send <code>/disconnect</code> to the bot to revoke its access and delete the stored token, or remove CardsBot at
+<a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. Contacts and the sheet remain in your Google account
+and can be deleted there.</p>
+<h2>Contact</h2>
+<p>yudalkl@gmail.com</p>
+</body></html>"""
+
+
+async def home(_request: web.Request) -> web.Response:
+    return web.Response(text=HOME_HTML, content_type="text/html")
+
+
+async def privacy(_request: web.Request) -> web.Response:
+    return web.Response(text=PRIVACY_HTML, content_type="text/html")
+
+
 def make_app(bot) -> web.Application:
     app = web.Application()
     app[BOT_KEY] = bot
     app.router.add_get("/oauth/callback", oauth_callback)
     app.router.add_get("/health", health)
+    app.router.add_get("/", home)
+    app.router.add_get("/privacy", privacy)
     return app
 
 

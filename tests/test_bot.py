@@ -585,6 +585,13 @@ class OAuthCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status, 400)
         self.assertIsNone((db.get_user(ADMIN) or {}).get("refresh_token_enc"))
 
+    async def test_home_and_privacy_pages(self):
+        r = await self.client.get("/")
+        self.assertEqual(r.status, 200)
+        self.assertIn("/privacy", await r.text())
+        r = await self.client.get("/privacy")
+        self.assertIn("drive.file", await r.text())
+
     async def test_unknown_state_and_cancel(self):
         r = await self.client.get("/oauth/callback?state=nope&code=abc")
         self.assertEqual(r.status, 400)
