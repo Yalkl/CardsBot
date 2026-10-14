@@ -14,7 +14,7 @@ import cards
 import config
 import database as db
 import google_auth
-from extractor import extract_contact_info, parse_question
+from extractor import extract_contact_info, parse_question, transcribe_audio
 from formatters import build_display_name, edit_menu, generate_vcard, render_preview, render_results
 
 HTML = "HTML"
@@ -24,6 +24,8 @@ WELCOME = (
     "👋 שלחו תמונה של כרטיס ביקור (צד אחד או שניים). הוא יישמר באנשי הקשר של גוגל ובטבלה בדרייב שלכם, עם הערה.\n\n"
     "🏷️ <b>/event</b> שם האירוע: כל כרטיס שתסרקו עד סוף היום יסומן באירוע. <b>/event off</b> מכבה.\n"
     "🔎 אפשר פשוט לשאול: \"את מי פגשנו שבוע שעבר בכנס הגרמני?\"\n"
+    "✏️ ולעדכן: \"ניקיטה עבר לכתובת הרצל 5, טשקנט\" או \"תוסיף הערה לאנה: שלחתי דוגמאות\".\n"
+    "🎙️ בכל מקום שכותבים אפשר גם לשלוח הקלטה קולית.\n"
     "📊 <b>/sheet</b>: קישור לטבלה. 🔌 <b>/connect</b> / <b>/disconnect</b>: חיבור לגוגל. 🆔 <b>/myid</b>"
 )
 NEED_CONNECT = "🔌 קודם מתחברים לגוגל: /connect"
@@ -366,7 +368,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Things that read the user's saved cards.
-    if action.startswith(("send_", "retry_")) or action in ("share_plain", "share_notes"):
+    if action == "upd_no":
+        context.user_data.pop("pending_update", None)
+        await query.edit_message_text("🚫 העדכון בוטל.")
+        return
+    if action.startswith(("send_", "retry_", "upd_pick_", "upd_yes_")) or action in ("share_plain", "share_notes"):
         g = await google_for(query.message, user.id)
         if not g:
             return
@@ -377,6 +383,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await google_failed(query.message, user.id, e)
             return
         by_id = {c["id"]: c for c in all_cards}
+        if action.startswith(("upd_pick_", "upd_yes_")):
+            pending = context.user_data.get("pending_update")
+            card = by_id.get(action.split("_", 2)[2])
+            if not pending or not card:
+                await query.edit_message_text("⚠️ העדכון פג. כתבו אותו שוב.")
+                return
+            if action.startswith("upd_pick_"):
+                text, markup = update_proposal(card, pending)
+                await query.edit_message_text(text, reply_markup=markup, parse_mode=HTML)
+                return
+            context.user_data.pop("pending_update", None)
+            try:
+                updated, contact_ok = await asyncio.to_thread(_apply_update, store, contacts, card, pending)
+            except Exception as e:
+                await google_failed(query.message, user.id, e)
+                return
+            status = "אנשי קשר ✓ · טבלה ✓" if contact_ok else "טבלה ✓ · אנשי קשר ✗"
+            markup = None if contact_ok else InlineKeyboardMarkup([[InlineKeyboardButton("🔁 נסה שוב לשמור באנשי קשר", callback_data=f"retry_{card['id']}")]])
+            await query.edit_message_text(f"✅ עודכן: <b>{escape(build_display_name(updated))}</b>\n{status}", reply_markup=markup, parse_mode=HTML)
+            return
         if action.startswith("send_"):
             card = by_id.get(action.split("_", 1)[1])
             if card:
@@ -465,8 +491,31 @@ def _retry_contact(store, contacts, card: dict):
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
+    await process_text(update, context, update.message.text.strip())
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A voice message counts as if its words were typed: a note, a field edit, a question or an update."""
+    if not await guard(update, context):
+        return
+    voice = update.message.voice or update.message.audio
+    status = await update.message.reply_text("🎙️ מקשיב…")
+    try:
+        f = await voice.get_file()
+        audio = bytes(await f.download_as_bytearray())
+        text = await asyncio.to_thread(transcribe_audio, audio, getattr(voice, "mime_type", None) or "audio/ogg")
+    except Exception:
+        await status.edit_text("⚠️ לא הצלחתי לתמלל. נסו שוב או כתבו.")
+        return
+    if not text:
+        await status.edit_text("🎙️ לא שמעתי דיבור. נסו שוב.")
+        return
+    await status.edit_text(f"🎙️ <i>{escape(text)}</i>", parse_mode=HTML)
+    await process_text(update, context, text[:1000])
+
+
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user = update.effective_user
-    text = update.message.text.strip()
     data = context.user_data.get("pending_contact")
 
     if data and context.user_data.get("editing_field"):
@@ -506,6 +555,70 @@ def describe_filter(f: dict) -> str:
     return " · ".join(parts)
 
 
+FIELD_LABELS = {
+    "first_name_he": "שם פרטי", "last_name_he": "שם משפחה", "first_name": "First name", "last_name": "Last name",
+    "job_title": "Title", "job_title_he": "תפקיד", "company": "חברה", "company_he": "חברה (עברית)", "country": "מדינה",
+    "phone": "טלפון", "email": "מייל", "website": "אתר", "telegram": "טלגרם", "address": "כתובת", "event": "אירוע",
+}
+
+
+def update_proposal(card: dict, pending: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """What will change, old → new, with confirm / cancel."""
+    lines = [f"✏️ לעדכן את <b>{escape(build_display_name(card))}</b>?", ""]
+    for field, new in pending["changes"].items():
+        old = card.get(field) or "—"
+        lines.append(f"• {FIELD_LABELS.get(field, field)}: {escape(old)} ← <b>{escape(new)}</b>")
+    if pending.get("note"):
+        if pending.get("note_mode") == "replace":
+            lines.append(f"• הערה (במקום הקיימת): <b>{escape(pending['note'])}</b>")
+        else:
+            lines.append(f"• הוספה להערה: <b>{escape(pending['note'])}</b>")
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ עדכן", callback_data=f"upd_yes_{card['id']}"),
+        InlineKeyboardButton("❌ ביטול", callback_data="upd_no"),
+    ]])
+    return "\n".join(lines), markup
+
+
+def _apply_update(store, contacts, card: dict, pending: dict) -> tuple[dict, bool]:
+    """Writes the confirmed change to the sheet and the Google contact. Returns (updated card, contacts ok)."""
+    updated = {**card, **pending["changes"]}
+    if "company" in pending["changes"] and "company_he" not in pending["changes"]:
+        updated["company_he"] = ""  # the old Hebrew name belonged to the old company
+    if "phone" in pending["changes"]:
+        updated["phone"] = db.clean_phone_number(updated["phone"])
+    if pending.get("note"):
+        if pending.get("note_mode") == "replace":
+            updated["note"] = pending["note"]
+        else:
+            dated = f"{date.today():%d.%m}: {pending['note']}"
+            updated["note"] = " | ".join(n for n in (card.get("note"), dated) if n)
+    contact_ok = True
+    try:
+        resource = card.get("google_contact")
+        updated["google_contact"] = contacts.update(resource, updated) if resource else contacts.create(updated)
+    except Exception:
+        contact_ok = False
+    store.update(card["id"], updated)
+    return updated, contact_ok
+
+
+async def propose_update(message, context: ContextTypes.DEFAULT_TYPE, f: dict, all_cards: list[dict]):
+    pending = {"changes": f["changes"], "note": f.get("note"), "note_mode": f.get("note_mode", "append")}
+    candidates = cards.search(all_cards, f["who"], limit=5)
+    if not candidates:
+        await message.edit_text(f"🔎 לא מצאתי את מי לעדכן ({escape(', '.join(f['who'][:4]))}). נסו עם שם או חברה.", parse_mode=HTML)
+        return
+    context.user_data["pending_update"] = pending
+    if len(candidates) == 1:
+        text, markup = update_proposal(candidates[0], pending)
+        await message.edit_text(text, reply_markup=markup, parse_mode=HTML)
+        return
+    rows = [[InlineKeyboardButton(build_display_name(c)[:60], callback_data=f"upd_pick_{c['id']}")] for c in candidates]
+    rows.append([InlineKeyboardButton("❌ ביטול", callback_data="upd_no")])
+    await message.edit_text("✏️ את מי לעדכן?", reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str):
     user = update.effective_user
     g = await google_for(update, user.id)
@@ -520,6 +633,9 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
     except Exception as e:
         await status.delete()
         await google_failed(update.message, user.id, e)
+        return
+    if f.get("action") == "update":
+        await propose_update(status, context, f, all_cards)
         return
     rows = cards.search(all_cards, f["terms"], f["date_from"], f["date_to"])
     context.user_data["last_results"] = [r["id"] for r in rows]

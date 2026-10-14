@@ -188,6 +188,29 @@ async def text(ctx, uid, t):
     await handlers.handle_text_input(upd(uid, t), ctx)
 
 
+async def voice(ctx, uid, spoken):
+    """A voice message; the fake transcription returns `spoken`."""
+    handlers.transcribe_audio = lambda audio, mime=None: spoken
+    u = upd(uid)
+
+    async def get_file():
+        async def dl():
+            return bytearray(b"ogg")
+        return SimpleNamespace(download_as_bytearray=dl)
+
+    u.message.voice = SimpleNamespace(get_file=get_file, mime_type="audio/ogg")
+    u.message.audio = None
+    await handlers.handle_voice(u, ctx)
+
+
+def search_filter(terms=None, date_from=None, date_to=None):
+    return {"action": "search", "date_from": date_from, "date_to": date_to, "terms": terms or [], "who": [], "changes": {}, "note": None, "note_mode": "append"}
+
+
+def update_filter(who, changes=None, note=None, note_mode="append"):
+    return {"action": "update", "date_from": None, "date_to": None, "terms": [], "who": who, "changes": changes or {}, "note": note, "note_mode": note_mode}
+
+
 async def press(ctx, uid, data):
     m = Msg(uid)
 
@@ -418,6 +441,88 @@ class Bot_(unittest.TestCase):
         run(press(self.other, OTHER, f"send_{self.g().rows[0]['id']}"))  # someone else's card id
         self.assertFalse(any(e[0] == "contact" and e[1] == OTHER for e in log))
 
+    # ---- updating a saved contact by message
+
+    def test_update_by_message_shows_change_then_applies_to_sheet_and_contact(self):
+        self._save(self.admin, ADMIN, NIKITA, "פגישה ראשונה")
+        handlers.parse_question = lambda q, d=None: update_filter(["Nikita", "ניקיטה"], {"address": "הרצל 5, טשקנט"}, "עבר משרד")
+        run(text(self.admin, ADMIN, "ניקיטה עבר לכתובת הרצל 5 טשקנט, עבר משרד"))
+        proposal = last("edit", ADMIN)
+        self.assertIn("לעדכן את", proposal[2])
+        self.assertIn("כתובת: — ← <b>הרצל 5, טשקנט</b>", proposal[2])
+        self.assertIn("הוספה להערה", proposal[2])
+        card_id = self.g().rows[0]["id"]
+        self.assertEqual(buttons(proposal[3]), [f"upd_yes_{card_id}", "upd_no"])
+        self.assertEqual(self.g().rows[0]["address"], "", "nothing changes before confirming")
+        run(press(self.admin, ADMIN, f"upd_yes_{card_id}"))
+        self.assertIn("עודכן", last("edit", ADMIN)[2])
+        row = self.g().rows[0]
+        self.assertEqual(row["address"], "הרצל 5, טשקנט")
+        self.assertEqual(row["note"], f"פגישה ראשונה | {date.today():%d.%m}: עבר משרד")
+        self.assertEqual(self.g().contacts["people/1"]["address"], "הרצל 5, טשקנט")
+
+    def test_update_new_company_drops_old_hebrew_name_and_replace_note(self):
+        self._save(self.admin, ADMIN, NIKITA, "ישן")
+        handlers.parse_question = lambda q, d=None: update_filter(["Nikita"], {"company": "Uzbek Wine"}, "מחליף", "replace")
+        run(text(self.admin, ADMIN, "ניקיטה עבר ל-Uzbek Wine, תחליף את ההערה ל: מחליף"))
+        run(press(self.admin, ADMIN, f"upd_yes_{self.g().rows[0]['id']}"))
+        row = self.g().rows[0]
+        self.assertEqual((row["company"], row["company_he"], row["note"]), ("Uzbek Wine", "", "מחליף"))
+        self.assertIn("Uzbek Wine", last("edit", ADMIN)[2])
+
+    def test_update_with_several_matches_asks_who(self):
+        self._save(self.admin, ADMIN, ANNA)
+        self._save(self.admin, ADMIN, {**ANNA, "first_name": "Anna", "last_name": "Weber", "phone": "+49 170 1111111", "last_name_he": "וובר"})
+        handlers.parse_question = lambda q, d=None: update_filter(["Anna"], {"phone": "+49 171 2222222"})
+        run(text(self.admin, ADMIN, "לאנה יש טלפון חדש"))
+        choose = last("edit", ADMIN)
+        self.assertIn("את מי לעדכן", choose[2])
+        picks = [b for b in buttons(choose[3]) if b.startswith("upd_pick_")]
+        self.assertEqual(len(picks), 2)
+        run(press(self.admin, ADMIN, picks[0]))
+        target = picks[0].removeprefix("upd_pick_")
+        run(press(self.admin, ADMIN, f"upd_yes_{target}"))
+        phones = {r["id"]: r["phone"] for r in self.g().rows}
+        self.assertEqual(phones[target], "+491712222222")
+        self.assertEqual(sum(1 for p in phones.values() if p == "+491712222222"), 1)
+
+    def test_update_cancel_and_no_match(self):
+        self._save(self.admin, ADMIN, NIKITA)
+        handlers.parse_question = lambda q, d=None: update_filter(["Nikita"], {"email": "x@y.z"})
+        run(text(self.admin, ADMIN, "מייל חדש לניקיטה"))
+        run(press(self.admin, ADMIN, "upd_no"))
+        self.assertIn("בוטל", last("edit", ADMIN)[2])
+        self.assertEqual(self.g().rows[0]["email"], "n.ivanov@mfa.bg")
+        handlers.parse_question = lambda q, d=None: update_filter(["Boris"], {"email": "x@y.z"})
+        run(text(self.admin, ADMIN, "מייל חדש לבוריס"))
+        self.assertIn("לא מצאתי את מי לעדכן", last("edit", ADMIN)[2])
+
+    # ---- voice
+
+    def test_voice_note_while_saving(self):
+        run(photo(self.admin, ADMIN, NIKITA))
+        run(press(self.admin, ADMIN, "save_default"))
+        run(voice(self.admin, ADMIN, "רוצה לבוא לביקור באביב"))
+        self.assertIn("🎙️ <i>רוצה לבוא לביקור באביב</i>", [e[2] for e in log if e[0] == "edit"])
+        self.assertEqual(self.g().rows[0]["note"], "רוצה לבוא לביקור באביב")
+
+    def test_voice_question_and_update(self):
+        self._save(self.admin, ADMIN, NIKITA)
+        handlers.parse_question = lambda q, d=None: search_filter(["Nikita"])
+        run(voice(self.admin, ADMIN, "מה המספר של ניקיטה"))
+        self.assertIn("ניקיטה", last("edit", ADMIN)[2])
+        handlers.parse_question = lambda q, d=None: update_filter(["Nikita"], {"address": "טשקנט"})
+        run(voice(self.admin, ADMIN, "ניקיטה עבר לטשקנט"))
+        self.assertIn("לעדכן את", last("edit", ADMIN)[2])
+
+    def test_voice_without_speech(self):
+        run(voice(self.admin, ADMIN, ""))
+        self.assertIn("לא שמעתי", last("edit", ADMIN)[2])
+
+    def test_voice_from_stranger_is_ignored(self):
+        run(voice(self.stranger, STRANGER, "שלום"))
+        self.assertIn("בקשת הגישה נשלחה", last("reply", STRANGER)[2])
+
     def test_sheet_command(self):
         run(command(handlers.sheet_cmd, self.admin, ADMIN))
         self.assertIn("docs.google.com/spreadsheets", last("reply", ADMIN)[2])
@@ -608,10 +713,19 @@ class QuestionParser(unittest.TestCase):
             return SimpleNamespace(text=response_text)
         extractor.gemini_client = SimpleNamespace(models=SimpleNamespace(generate_content=gen))
 
-    def test_valid_output(self):
-        self._gemini('{"date_from": "2026-10-04", "date_to": "2026-10-10", "terms": ["Germany", "גרמניה"]}')
+    def test_valid_search(self):
+        self._gemini('{"action": "search", "date_from": "2026-10-04", "date_to": "2026-10-10", "terms": ["Germany", "גרמניה"]}')
         f = extractor.parse_question("את מי פגשנו שבוע שעבר בכנס הגרמני?", date(2026, 10, 14))
-        self.assertEqual(f, {"date_from": "2026-10-04", "date_to": "2026-10-10", "terms": ["Germany", "גרמניה"]})
+        self.assertEqual(f, search_filter(["Germany", "גרמניה"], "2026-10-04", "2026-10-10"))
+
+    def test_valid_update_keeps_only_known_fields(self):
+        self._gemini('{"action": "update", "who": ["Nikita", "ניקיטה"], "changes": {"address": "הרצל 5", "salary": "1M", "phone": ""}, "note": "עבר משרד", "note_mode": "weird"}')
+        f = extractor.parse_question("ניקיטה עבר להרצל 5")
+        self.assertEqual(f, update_filter(["Nikita", "ניקיטה"], {"address": "הרצל 5"}, "עבר משרד"))
+
+    def test_update_without_who_or_change_becomes_a_search(self):
+        self._gemini('{"action": "update", "who": [], "changes": {"address": "x"}, "terms": ["x"]}')
+        self.assertEqual(extractor.parse_question("x")["action"], "search")
 
     def test_bad_dates_dropped(self):
         self._gemini('{"date_from": "last week", "date_to": null, "terms": ["Germany"]}')
@@ -619,7 +733,7 @@ class QuestionParser(unittest.TestCase):
 
     def test_failure_falls_back_to_words(self):
         self._gemini(error=RuntimeError("down"))
-        self.assertEqual(extractor.parse_question("הבחור הרומני"), {"date_from": None, "date_to": None, "terms": ["הבחור", "הרומני"]})
+        self.assertEqual(extractor.parse_question("הבחור הרומני"), search_filter(["הבחור", "הרומני"]))
 
 
 if __name__ == "__main__":

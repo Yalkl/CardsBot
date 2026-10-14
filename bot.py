@@ -36,6 +36,7 @@ def main():
     app.add_handler(CommandHandler("event", handlers.event_cmd))
     app.add_handler(CommandHandler("ask", handlers.ask_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handlers.handle_voice))
     app.add_handler(CallbackQueryHandler(handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_text_input))
 
